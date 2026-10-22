@@ -1,8 +1,7 @@
-// 変更日時：2026年10月23日 00時50分
+// 変更日時：2026年10月23日 00時24分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 const WebSocket = require('ws');
 const http = require('http');
-
 const port = process.env.PORT || 3000;
 
 // HTTPヘルスチェック用サーバー (RenderやGlitchの生存監視に対応)
@@ -30,12 +29,11 @@ wss.on('connection', (ws) => {
       if (type === 'join') {
         currentRoomId = roomId;
         currentUserId = userId;
-
         if (!rooms.has(roomId)) {
           rooms.set(roomId, new Set());
         }
         const room = rooms.get(roomId);
-
+        
         // 既存の入室者へ相手の参加を通知
         room.forEach((client) => {
           if (client.ws.readyState === WebSocket.OPEN) {
@@ -44,7 +42,7 @@ wss.on('connection', (ws) => {
         });
 
         room.add({ ws, userId });
-        console.log('[Join] Room: ' + roomId + ', User: ' + userId + ', Count: ' + room.size);
+        console.log(`[Join] Room: ${roomId}, User: ${userId}, Count: ${room.size}`);
         return;
       }
 
@@ -73,7 +71,6 @@ wss.on('connection', (ws) => {
   const onCloseOrError = () => {
     removeClientFromRoom(ws, currentRoomId, currentUserId);
   };
-
   ws.on('close', onCloseOrError);
   ws.on('error', onCloseOrError);
 });
@@ -92,8 +89,8 @@ function removeClientFromRoom(ws, roomId, userId) {
   });
   if (target) {
     room.delete(target);
-    console.log('[Leave] Room: ' + roomId + ', User: ' + userId + ', Remaining: ' + room.size);
-
+    console.log(`[Leave] Room: ${roomId}, User: ${userId}, Remaining: ${room.size}`);
+    
     // 残りのメンバーへ退出を通知
     room.forEach((client) => {
       if (client.ws.readyState === WebSocket.OPEN) {
@@ -108,5 +105,5 @@ function removeClientFromRoom(ws, roomId, userId) {
 
 // サーバー起動
 server.listen(port, () => {
-  console.log('Signaling server listening on port ' + port);
+  console.log(`Signaling server listening on port ${port}`);
 });
