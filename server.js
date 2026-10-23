@@ -1,9 +1,10 @@
-// 変更日時：2026年10月23日 23時52分
+// 変更日時：2026年10月24日 00時12分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、偽装防止検証、WebSocket認証＆レートリミット統合版
 
 const WebSocket = require('ws');
 const http = require('http');
+const https = require('https');
 const crypto = require('crypto');
 
 let nodemailer = null;
@@ -95,6 +96,86 @@ function createMailTransporter()
         connectionTimeout: 8000,
         greetingTimeout: 5000,
         socketTimeout: 10000
+    });
+}
+
+// GAS (Google Apps Script) WebHook 経由でのメール送信 (Port 443 HTTPS通信: Render無料枠対応)
+function sendMailViaGas(gasUrl, mailData)
+{
+    return new Promise((resolve, reject) =>
+    {
+        const postData = JSON.stringify(mailData);
+        const parsedUrl = new URL(gasUrl);
+
+        const options = {
+            hostname: parsedUrl.hostname,
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData)
+            },
+            timeout: 15000
+        };
+
+        const req = https.request(options, (res) =>
+        {
+            // GAS WebAppは302リダイレクト経由でContentServiceを返す
+            if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307)
+            {
+                const redirectUrl = res.headers.location;
+                if (!redirectUrl)
+                {
+                    return resolve({ success: true, redirected: true });
+                }
+                https.get(redirectUrl, (redirectRes) =>
+                {
+                    let body = '';
+                    redirectRes.on('data', chunk => { body += chunk; });
+                    redirectRes.on('end', () =>
+                    {
+                        try
+                        {
+                            const json = JSON.parse(body);
+                            resolve(json);
+                        }
+                        catch (e)
+                        {
+                            resolve({ success: true, raw: body });
+                        }
+                    });
+                }).on('error', (err) =>
+                {
+                    console.warn('[GAS Redirect Note]', err.message);
+                    resolve({ success: true });
+                });
+                return;
+            }
+
+            let body = '';
+            res.on('data', chunk => { body += chunk; });
+            res.on('end', () =>
+            {
+                try
+                {
+                    resolve(JSON.parse(body));
+                }
+                catch (e)
+                {
+                    resolve({ success: res.statusCode >= 200 && res.statusCode < 300, raw: body });
+                }
+            });
+        });
+
+        req.on('timeout', () =>
+        {
+            req.destroy();
+            reject(new Error('GASメール送信接続タイムアウト'));
+        });
+
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
     });
 }
 
@@ -216,26 +297,62 @@ const server = http.createServer(async (req, res) =>
 
             console.log(`[Cross-Auth OTP] ログイン試行: ${email} -> 承認コード送信先: ${targetEmail} (${code})`);
 
-            // メール送信実行
+            // メール本文テンプレート生成
+            const mailSubject = `【CellPhone App】${email} からのログイン承認要求`;
+            const mailText = `CellPhone App にて「${email}」がログインを試行しています。\n\n心当たりがある場合は、以下の6桁の承認コードをLINE等で相手にお伝えください。\n\n承認コード: ${code}\n\n※このコードの有効期限は5分間です。\n※心当たりのない場合は絶対に他人にコードを教えないでください。`;
+            const mailHtml = `
+                <div style="font-family: sans-serif; max-width: 500px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
+                    <h2 style="color: #3B82F6; margin-top: 0;">CellPhone App 相互承認要求</h2>
+                    <p><strong>「${email}」</strong> がアプリへのサインインを試行しています。</p>
+                    <p>ご本人からの連絡であることを確認した上で、以下の承認コードを<strong>LINE等</strong>でお伝えください。</p>
+                    <div style="background-color: #EFF6FF; padding: 15px; border-radius: 6px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #1D4ED8; margin: 20px 0; border: 1px dashed #93C5FD;">
+                        ${code}
+                    </div>
+                    <p style="font-size: 13px; color: #6B7280;">※この承認コードの有効期限は<strong>5分間</strong>です。<br>※身に覚えのない場合は絶対にコードを伝えないでください。</p>
+                </div>
+            `;
+
+            // 【最優先】GAS (Google Apps Script) WebHook によるメール送信 (Port 443 HTTPS通信)
+            const gasUrl = process.env.GAS_MAIL_URL;
+            if (gasUrl)
+            {
+                try
+                {
+                    console.log(`[GAS Mail] 送信開始: ${targetEmail} via ${gasUrl.slice(0, 45)}...`);
+                    await sendMailViaGas(gasUrl, {
+                        to: targetEmail,
+                        subject: mailSubject,
+                        text: mailText,
+                        html: mailHtml
+                    });
+                    console.log(`[GAS Mail] 送信成功: ${targetEmail}`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                        success: true,
+                        message: `承認コードを「${maskedTarget}」宛てに送信しました。\n相手の方からLINE等でコードを受け取ってください。`,
+                        targetNotice: maskedTarget
+                    }));
+                    return;
+                }
+                catch (gasErr)
+                {
+                    console.error('[GAS Mail Error]', gasErr);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'GASメール送信エラー: ' + gasErr.message }));
+                    return;
+                }
+            }
+
+            // 【フォールバック】SMTPによるメール送信
             const transporter = createMailTransporter();
             if (transporter)
             {
                 const mailOptions = {
                     from: `"CellPhone App 相互承認" <${process.env.GMAIL_USER}>`,
                     to: targetEmail,
-                    subject: `【CellPhone App】${email} からのログイン承認要求`,
-                    text: `CellPhone App にて「${email}」がログインを試行しています。\n\n心当たりがある場合は、以下の6桁の承認コードをLINE等で相手にお伝えください。\n\n承認コード: ${code}\n\n※このコードの有効期限は5分間です。\n※心当たりのない場合は絶対に他人にコードを教えないでください。`,
-                    html: `
-                        <div style="font-family: sans-serif; max-width: 500px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
-                            <h2 style="color: #3B82F6; margin-top: 0;">CellPhone App 相互承認要求</h2>
-                            <p><strong>「${email}」</strong> がアプリへのサインインを試行しています。</p>
-                            <p>ご本人からの連絡であることを確認した上で、以下の承認コードを<strong>LINE等</strong>でお伝えください。</p>
-                            <div style="background-color: #EFF6FF; padding: 15px; border-radius: 6px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #1D4ED8; margin: 20px 0; border: 1px dashed #93C5FD;">
-                                ${code}
-                            </div>
-                            <p style="font-size: 13px; color: #6B7280;">※この承認コードの有効期限は<strong>5分間</strong>です。<br>※身に覚えのない場合は絶対にコードを伝えないでください。</p>
-                        </div>
-                    `
+                    subject: mailSubject,
+                    text: mailText,
+                    html: mailHtml
                 };
 
                 await transporter.sendMail(mailOptions);
@@ -249,8 +366,8 @@ const server = http.createServer(async (req, res) =>
             }
             else
             {
-                // GMAIL_USER/GMAIL_APP_PASS 未設定時の安全フォールバック (ログ出力＋開発用コード返却)
-                console.warn(`[OTP Fallback] メール環境変数が未設定のためログにコード出力: ${code}`);
+                // GMAIL_USER/GAS_MAIL_URL 未設定時の安全フォールバック (ログ出力＋開発用コード返却)
+                console.warn(`[OTP Fallback] メール送信設定が未設定のためテスト用コードを返却: ${code}`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     success: true,
