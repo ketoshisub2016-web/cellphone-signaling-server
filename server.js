@@ -547,7 +547,7 @@ const server = http.createServer(async (req, res) =>
                 res.end(JSON.stringify({ success: false, error: '認証コードの有効期限が切れました。再送信してください' }));
                 return;
             }
-
+            
             // 試行回数制限 (5回ミスで無効化)
             entry.attempts++;
             if (entry.attempts > 5)
