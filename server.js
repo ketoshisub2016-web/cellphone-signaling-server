@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 01時48分
+// 変更日時：2026年10月24日 02時30分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -222,6 +222,10 @@ async function sendIncomingCallPush(targetFcmToken, callData)
     {
         const message = {
             token: targetFcmToken,
+            notification: {
+                title: `${callData.fromName || '通話相手'} から着信`,
+                body: '通話の着信中…'
+            },
             data: {
                 type: 'incoming_call',
                 fromUserId: callData.fromUserId || '',
@@ -230,6 +234,12 @@ async function sendIncomingCallPush(targetFcmToken, callData)
             },
             android: {
                 priority: 'high',
+                notification: {
+                    channelId: 'incoming_call_channel_v2',
+                    priority: 'max',
+                    defaultSound: true,
+                    defaultVibrateTimings: true
+                },
                 ttl: 60 * 1000 // 60秒有効
             }
         };
@@ -265,6 +275,10 @@ async function sendChatMessagePush(targetFcmToken, chatData)
     {
         const message = {
             token: targetFcmToken,
+            notification: {
+                title: `${chatData.fromName || '友だち'}`,
+                body: '新着メッセージが届きました'
+            },
             data: {
                 type: 'chat_message',
                 fromUserId: chatData.fromUserId || '',
@@ -273,6 +287,12 @@ async function sendChatMessagePush(targetFcmToken, chatData)
             },
             android: {
                 priority: 'high',
+                notification: {
+                    channelId: 'chat_message_channel_v1',
+                    priority: 'max',
+                    defaultSound: true,
+                    defaultVibrateTimings: true
+                },
                 ttl: 7 * 24 * 60 * 60 * 1000 // 7日間有効
             }
         };
@@ -719,24 +739,30 @@ wss.on('connection', (ws) =>
                 console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
                 ws.send(JSON.stringify({ type: 'registered', userId: userId }));
 
-                // 保留されていたオフラインメッセージがあれば一括配信！
+                // 保留されていたオフラインメッセージがあれば順次安全配信！
                 if (offlineMessageQueue.has(userId))
                 {
                     const queuedMessages = offlineMessageQueue.get(userId) || [];
                     if (queuedMessages.length > 0)
                     {
-                        console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を一括配信`);
-                        for (const msgData of queuedMessages)
+                        console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を順次配信`);
+                        queuedMessages.forEach((msgData, idx) =>
                         {
-                            ws.send(JSON.stringify(msgData));
-                        }
+                            setTimeout(() =>
+                            {
+                                if (ws.readyState === WebSocket.OPEN)
+                                {
+                                    ws.send(JSON.stringify(msgData));
+                                }
+                            }, idx * 50);
+                        });
                     }
                     offlineMessageQueue.delete(userId);
                 }
                 return;
             }
 
-            // 着信コール通知 (WebSocket中継 ＆ FCM高優先度プッシュ同時送信)
+            // 着信コール通知 (WebSocket中継 ＆ FCM高優先度プッシュ二重化同時送信)
             if (type === 'call_invite')
             {
                 const targetUserId = data.targetUserId;
@@ -755,11 +781,11 @@ wss.on('connection', (ws) =>
                     forwardedViaWs = true;
                 }
 
-                // LINE同等の通知バー不要・完全バックグラウンド着信: 相手の端末へFCMプッシュ送信
-                const targetFcm = fcmTokenStore.get(targetUserId);
+                // LINE同等の通知バー不要・完全バックグラウンド着信: 画面オフ・スリープ端末を確実に起こすためFCMプッシュも常に同時送信
+                const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
                 if (targetFcm && targetFcm.fcmToken)
                 {
-                    console.log(`[Call Invite] Triggering FCM Push to offline/background target: ${targetUserId}`);
+                    console.log(`[Call Invite] Triggering FCM Push to target: ${targetUserId} (wsOnline=${forwardedViaWs})`);
                     sendIncomingCallPush(targetFcm.fcmToken, {
                         fromUserId: data.fromUserId,
                         fromName: data.fromName,
@@ -768,6 +794,7 @@ wss.on('connection', (ws) =>
                 }
                 else if (!forwardedViaWs)
                 {
+                    console.warn(`[Call Invite Offline] 相手(${targetUserId})はWebSocket切断かつFCMトークン未登録`);
                     ws.send(JSON.stringify({ type: 'call_user_offline', targetUserId: targetUserId }));
                 }
                 return;
@@ -825,14 +852,19 @@ wss.on('connection', (ws) =>
                     console.log(`[E2EE Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
 
                     // 相手の端末へFCM高優先度新着プッシュを送信！
-                    const targetFcm = fcmTokenStore.get(targetUserId);
+                    const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
                     if (targetFcm && targetFcm.fcmToken)
                     {
+                        console.log(`[FCM Chat Push] 相手(${targetUserId})のFCMトークン検知。プッシュ送信実行`);
                         sendChatMessagePush(targetFcm.fcmToken, {
                             fromUserId: data.fromUserId,
                             fromName: senderName,
                             messageId: data.messageId
                         });
+                    }
+                    else
+                    {
+                        console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
                     }
                 }
                 return;
@@ -870,19 +902,30 @@ wss.on('connection', (ws) =>
                 {
                     const allUids = roomId.match(/u_[a-zA-Z0-9]+/g) || [];
                     const targetUid = allUids.find(id => id !== userId);
-                    if (targetUid && users.has(targetUid))
+                    if (targetUid)
                     {
+                        const callerName = data.userName || users.get(userId)?.name || '友だち';
                         const targetEntry = users.get(targetUid);
                         if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                         {
-                            const callerName = data.userName || users.get(userId)?.name || '友だち';
                             targetEntry.ws.send(JSON.stringify({
                                 type: 'incoming_call',
                                 fromUserId: userId,
                                 fromName: callerName,
                                 roomId: roomId
                             }));
-                            console.log(`[Auto-Call-Push] Sent incoming call to ${targetUid} from ${userId}`);
+                            console.log(`[Auto-Call-Push] Sent incoming call via WS to ${targetUid} from ${userId}`);
+                        }
+
+                        // 相手端末がバックグラウンド/キル時でも確実に着信通知が届くようFCMプッシュを二重発火
+                        const targetFcm = fcmTokenStore.get(targetUid) || fcmTokenStore.get(targetUid.trim());
+                        if (targetFcm && targetFcm.fcmToken)
+                        {
+                            sendIncomingCallPush(targetFcm.fcmToken, {
+                                fromUserId: userId,
+                                fromName: callerName,
+                                roomId: roomId
+                            });
                         }
                     }
                 }
