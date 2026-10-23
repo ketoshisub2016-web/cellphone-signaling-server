@@ -1,4 +1,4 @@
-// 変更日時：2026年10月23日 15時22分
+// 変更日時：2026年10月23日 23時52分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -87,8 +87,14 @@ function createMailTransporter()
         return null;
     }
     return nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user, pass }
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        auth: { user, pass },
+        family: 4, // IPv4強制 (Node.js 18+ のIPv6接続ハング・タイムアウト防止)
+        connectionTimeout: 8000,
+        greetingTimeout: 5000,
+        socketTimeout: 10000
     });
 }
 
