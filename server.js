@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 00時48分
+// 変更日時：2026年10月24日 01時35分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -208,7 +208,16 @@ function sendMailViaGas(gasUrl, mailData)
 // FCM高優先度着信プッシュ送信 (LINE同等の通知バー不要・完全バックグラウンド着信)
 async function sendIncomingCallPush(targetFcmToken, callData)
 {
-    if (!firebaseApp || !admin || !targetFcmToken) { return false; }
+    if (!firebaseApp || !admin)
+    {
+        console.warn('[FCM Push Warning] Firebase Admin未初期化のため着信プッシュをスキップ');
+        return false;
+    }
+    if (!targetFcmToken)
+    {
+        console.warn('[FCM Push Warning] 宛先FCMトークン未登録のため着信プッシュ送信不可');
+        return false;
+    }
     try
     {
         const message = {
@@ -232,6 +241,49 @@ async function sendIncomingCallPush(targetFcmToken, callData)
     catch (err)
     {
         console.error('[FCM Push Error] プッシュ送信失敗:', err.message);
+        return false;
+    }
+}
+
+// オフラインチャットメッセージ一時保管キュー (targetUserId -> [ messageData ])
+const offlineMessageQueue = new Map();
+
+// FCM新着チャットプッシュ送信 (LINE同等のバックグラウンド新着メッセージ通知)
+async function sendChatMessagePush(targetFcmToken, chatData)
+{
+    if (!firebaseApp || !admin)
+    {
+        console.warn('[FCM Chat Push Warning] Firebase Admin未初期化のためチャットプッシュをスキップ (FIREBASE_SERVICE_ACCOUNT未設定)');
+        return false;
+    }
+    if (!targetFcmToken)
+    {
+        console.warn('[FCM Chat Push Warning] 宛先FCMトークン未登録のためチャットプッシュ送信不可');
+        return false;
+    }
+    try
+    {
+        const message = {
+            token: targetFcmToken,
+            data: {
+                type: 'chat_message',
+                fromUserId: chatData.fromUserId || '',
+                fromName: chatData.fromName || '友だち',
+                messageId: chatData.messageId || ''
+            },
+            android: {
+                priority: 'high',
+                ttl: 7 * 24 * 60 * 60 * 1000 // 7日間有効
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`[FCM Chat Push] 新着チャットプッシュ送信完了 (${chatData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+        return true;
+    }
+    catch (err)
+    {
+        console.error('[FCM Chat Push Error] チャットプッシュ送信失敗:', err.message);
         return false;
     }
 }
@@ -303,7 +355,14 @@ const server = http.createServer(async (req, res) =>
     if (req.method === 'GET' && (url === '/' || url === '/health'))
     {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ status: 'ok', server: 'CellPhone Signaling Server', activeUsers: users.size }));
+        res.end(JSON.stringify({
+            status: 'ok',
+            server: 'CellPhone Signaling Server',
+            activeUsers: users.size,
+            firebaseInitialized: !!firebaseApp,
+            fcmTokensCount: fcmTokenStore.size,
+            offlineQueuedUsersCount: offlineMessageQueue.size
+        }));
         return;
     }
 
@@ -662,6 +721,21 @@ wss.on('connection', (ws) =>
                 users.set(userId, { ws, name: data.name || '友だち', token: token });
                 console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
                 ws.send(JSON.stringify({ type: 'registered', userId: userId }));
+
+                // 保留されていたオフラインメッセージがあれば一括配信！
+                if (offlineMessageQueue.has(userId))
+                {
+                    const queuedMessages = offlineMessageQueue.get(userId) || [];
+                    if (queuedMessages.length > 0)
+                    {
+                        console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を一括配信`);
+                        for (const msgData of queuedMessages)
+                        {
+                            ws.send(JSON.stringify(msgData));
+                        }
+                    }
+                    offlineMessageQueue.delete(userId);
+                }
                 return;
             }
 
@@ -714,7 +788,7 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // チャットメッセージ中継 (E2EE暗号文転送 ＆ なりすまし・巨大パケット検証)
+            // チャットメッセージ中継 (E2EE暗号文転送 ＆ オフラインキューイング ＆ FCM新着プッシュ連動)
             if (type === 'chat_message')
             {
                 // 送信者UID偽装チェック
@@ -733,6 +807,8 @@ wss.on('connection', (ws) =>
 
                 const targetUserId = data.targetUserId;
                 const targetEntry = users.get(targetUserId);
+                const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
+
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
                     targetEntry.ws.send(JSON.stringify(data));
@@ -740,7 +816,27 @@ wss.on('connection', (ws) =>
                 }
                 else
                 {
-                    ws.send(JSON.stringify({ type: 'chat_user_offline', targetUserId: targetUserId, messageId: data.messageId }));
+                    // 相手がオフラインの場合: サーバー側キューに一時保管
+                    if (!offlineMessageQueue.has(targetUserId))
+                    {
+                        offlineMessageQueue.set(targetUserId, []);
+                    }
+                    const queue = offlineMessageQueue.get(targetUserId);
+                    queue.push(data);
+                    if (queue.length > 50) { queue.shift(); } // 最大50件保持
+
+                    console.log(`[E2EE Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
+
+                    // 相手の端末へFCM高優先度新着プッシュを送信！
+                    const targetFcm = fcmTokenStore.get(targetUserId);
+                    if (targetFcm && targetFcm.fcmToken)
+                    {
+                        sendChatMessagePush(targetFcm.fcmToken, {
+                            fromUserId: data.fromUserId,
+                            fromName: senderName,
+                            messageId: data.messageId
+                        });
+                    }
                 }
                 return;
             }
