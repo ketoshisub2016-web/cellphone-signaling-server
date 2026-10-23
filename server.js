@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 02時30分
+// 変更日時：2026年10月24日 03時10分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -930,12 +930,21 @@ wss.on('connection', (ws) =>
                     }
                 }
 
-                // 既存の入室者へ相手の参加を通知
+                // 1. 既存の入室者へ新参加者の入室を通知
                 room.forEach((client) =>
                 {
-                    if (client.ws.readyState === WebSocket.OPEN)
+                    if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN)
                     {
                         client.ws.send(JSON.stringify({ type: 'joined', peerId: userId }));
+                    }
+                });
+
+                // 2. 新入室者へも既存の入室者を通知 (入室順序に関わらず相互検知を100%保証)
+                room.forEach((client) =>
+                {
+                    if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN)
+                    {
+                        ws.send(JSON.stringify({ type: 'joined', peerId: client.userId }));
                     }
                 });
 
