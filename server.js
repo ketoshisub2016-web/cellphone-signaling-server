@@ -1,11 +1,37 @@
-// 変更日時：2026年10月24日 00時12分
+// 変更日時：2026年10月24日 00時48分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
-// 二段階認証(メールOTP)、E2EEチャット中継、偽装防止検証、WebSocket認証＆レートリミット統合版
+// 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const fs = require('fs');
+
+let admin = null;
+let firebaseApp = null;
+try
+{
+    admin = require('firebase-admin');
+    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+        : (fs.existsSync('./firebase-adminsdk.json') ? require('./firebase-adminsdk.json') : null);
+
+    if (serviceAccount && admin)
+    {
+        firebaseApp = admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('[Firebase Admin] FCM プッシュ送信機能の初期化完了');
+    }
+}
+catch (e)
+{
+    console.warn('[Firebase Admin Note] 初期化スキップまたは保留:', e.message);
+}
+
+// FCMデバイストークン保管ストア (userId -> { fcmToken, email, updatedAt })
+const fcmTokenStore = new Map();
 
 let nodemailer = null;
 try
@@ -177,6 +203,37 @@ function sendMailViaGas(gasUrl, mailData)
         req.write(postData);
         req.end();
     });
+}
+
+// FCM高優先度着信プッシュ送信 (LINE同等の通知バー不要・完全バックグラウンド着信)
+async function sendIncomingCallPush(targetFcmToken, callData)
+{
+    if (!firebaseApp || !admin || !targetFcmToken) { return false; }
+    try
+    {
+        const message = {
+            token: targetFcmToken,
+            data: {
+                type: 'incoming_call',
+                fromUserId: callData.fromUserId || '',
+                fromName: callData.fromName || '通話相手',
+                roomId: callData.roomId || ''
+            },
+            android: {
+                priority: 'high',
+                ttl: 60 * 1000 // 60秒有効
+            }
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`[FCM Push] 着信プッシュ送信完了 (${callData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+        return true;
+    }
+    catch (err)
+    {
+        console.error('[FCM Push Error] プッシュ送信失敗:', err.message);
+        return false;
+    }
 }
 
 // JSONリクエストボディの取得ヘルパー
@@ -469,6 +526,39 @@ const server = http.createServer(async (req, res) =>
         }
     }
 
+    // [API 3] FCMデバイストークン登録: POST /api/user/fcm-token
+    if (req.method === 'POST' && url === '/api/user/fcm-token')
+    {
+        try
+        {
+            const body = await parseJsonBody(req);
+            const userId = (body.userId || '').trim();
+            const email = (body.email || '').trim().toLowerCase();
+            const fcmToken = (body.fcmToken || '').trim();
+
+            if (!userId || !fcmToken)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'userIdまたはfcmTokenが不正です' }));
+                return;
+            }
+
+            fcmTokenStore.set(userId, { fcmToken, email, updatedAt: Date.now() });
+            console.log(`[FCM Token] 登録成功: ${userId} (${email}) -> ${fcmToken.slice(0, 15)}...`);
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true }));
+            return;
+        }
+        catch (err)
+        {
+            console.error('[FCM Token Error]', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
+    }
+
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
 });
@@ -575,11 +665,13 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 着信コール通知
+            // 着信コール通知 (WebSocket中継 ＆ FCM高優先度プッシュ同時送信)
             if (type === 'call_invite')
             {
                 const targetUserId = data.targetUserId;
                 const targetEntry = users.get(targetUserId);
+
+                let forwardedViaWs = false;
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
                     targetEntry.ws.send(JSON.stringify({
@@ -588,9 +680,22 @@ wss.on('connection', (ws) =>
                         fromName: data.fromName,
                         roomId: data.roomId
                     }));
-                    console.log(`[Call Invite] Forwarded from ${data.fromUserId} to ${targetUserId}`);
+                    console.log(`[Call Invite] Forwarded via WebSocket from ${data.fromUserId} to ${targetUserId}`);
+                    forwardedViaWs = true;
                 }
-                else
+
+                // LINE同等の通知バー不要・完全バックグラウンド着信: 相手の端末へFCMプッシュ送信
+                const targetFcm = fcmTokenStore.get(targetUserId);
+                if (targetFcm && targetFcm.fcmToken)
+                {
+                    console.log(`[Call Invite] Triggering FCM Push to offline/background target: ${targetUserId}`);
+                    sendIncomingCallPush(targetFcm.fcmToken, {
+                        fromUserId: data.fromUserId,
+                        fromName: data.fromName,
+                        roomId: data.roomId
+                    });
+                }
+                else if (!forwardedViaWs)
                 {
                     ws.send(JSON.stringify({ type: 'call_user_offline', targetUserId: targetUserId }));
                 }
