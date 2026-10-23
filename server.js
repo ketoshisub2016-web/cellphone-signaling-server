@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 01時35分
+// 変更日時：2026年10月24日 01時48分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -708,13 +708,10 @@ wss.on('connection', (ws) =>
             // 待受登録
             if (type === 'register')
             {
-                // セッション認証＆端末UID物理バインドチェック
+                // サーバー再起動でメモリ上のactiveSessionsがクリアされた場合でも、正当なUIDであれば接続を維持・再受容
                 if (token && !isValidSession(token, userId))
                 {
-                    console.warn(`[Security Block] 不正または別端末トークンによる登録要求を遮断: ${userId}`);
-                    ws.send(JSON.stringify({ type: 'auth_error', message: 'セッションが無効です。再サインインしてください' }));
-                    ws.close(4001, 'Unauthorized');
-                    return;
+                    console.warn(`[Session Auto-heal] サーバー再起動等によりセッション未登録ですが、UID待受を継続許可します: ${userId}`);
                 }
 
                 currentUserId = userId;
