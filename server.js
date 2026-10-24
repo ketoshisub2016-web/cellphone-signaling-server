@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 03時10分
+// 変更日時：2026年10月24日 15時15分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -258,7 +258,7 @@ async function sendIncomingCallPush(targetFcmToken, callData)
 // オフラインチャットメッセージ一時保管キュー (targetUserId -> [ messageData ])
 const offlineMessageQueue = new Map();
 
-// FCM新着チャットプッシュ送信 (LINE同等のバックグラウンド新着メッセージ通知)
+// FCM新着チャットプッシュ送信 (二重通知防止のためdataメッセージで統一・暗号化本文を完全伝送)
 async function sendChatMessagePush(targetFcmToken, chatData)
 {
     if (!firebaseApp || !admin)
@@ -273,32 +273,28 @@ async function sendChatMessagePush(targetFcmToken, chatData)
     }
     try
     {
+        // OSによる二重通知を完全防止するため notification属性は含めず dataメッセージのみで送信
         const message = {
             token: targetFcmToken,
-            notification: {
-                title: `${chatData.fromName || '友だち'}`,
-                body: '新着メッセージが届きました'
-            },
             data: {
                 type: 'chat_message',
-                fromUserId: chatData.fromUserId || '',
-                fromName: chatData.fromName || '友だち',
-                messageId: chatData.messageId || ''
+                fromUserId: String(chatData.fromUserId || ''),
+                fromName: String(chatData.fromName || '友だち'),
+                messageId: String(chatData.messageId || ''),
+                text: String(chatData.text || ''),
+                iv: String(chatData.iv || ''),
+                cipher: String(chatData.cipher || ''),
+                imageBase64: String(chatData.imageBase64 || ''),
+                timestamp: String(chatData.timestamp || Date.now())
             },
             android: {
                 priority: 'high',
-                notification: {
-                    channelId: 'chat_message_channel_v1',
-                    priority: 'max',
-                    defaultSound: true,
-                    defaultVibrateTimings: true
-                },
                 ttl: 7 * 24 * 60 * 60 * 1000 // 7日間有効
             }
         };
 
         const response = await admin.messaging().send(message);
-        console.log(`[FCM Chat Push] 新着チャットプッシュ送信完了 (${chatData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+        console.log(`[FCM Chat Push] 新着チャットデータプッシュ送信完了 (${chatData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
         return true;
     }
     catch (err)
@@ -547,7 +543,7 @@ const server = http.createServer(async (req, res) =>
                 res.end(JSON.stringify({ success: false, error: '認証コードの有効期限が切れました。再送信してください' }));
                 return;
             }
-            
+
             // 試行回数制限 (5回ミスで無効化)
             entry.attempts++;
             if (entry.attempts > 5)
@@ -754,7 +750,7 @@ wss.on('connection', (ws) =>
                                 {
                                     ws.send(JSON.stringify(msgData));
                                 }
-                            }, idx * 50);
+                            }, idx * 100);
                         });
                     }
                     offlineMessageQueue.delete(userId);
@@ -859,7 +855,12 @@ wss.on('connection', (ws) =>
                         sendChatMessagePush(targetFcm.fcmToken, {
                             fromUserId: data.fromUserId,
                             fromName: senderName,
-                            messageId: data.messageId
+                            messageId: data.messageId,
+                            text: data.text || '',
+                            iv: data.iv || '',
+                            cipher: data.cipher || '',
+                            imageBase64: data.imageBase64 || '',
+                            timestamp: data.timestamp || Date.now()
                         });
                     }
                     else
