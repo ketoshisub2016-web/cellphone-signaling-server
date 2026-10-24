@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 15時15分
+// 変更日時：2026年10月24日 15時25分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -931,12 +931,14 @@ wss.on('connection', (ws) =>
                     }
                 }
 
-                // 1. 既存の入室者へ新参加者の入室を通知
+                const isCaller = !!data.isCaller;
+
+                // 1. 既存の入室者へ新参加者の入室を通知 (発信者フラグを付与)
                 room.forEach((client) =>
                 {
                     if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN)
                     {
-                        client.ws.send(JSON.stringify({ type: 'joined', peerId: userId }));
+                        client.ws.send(JSON.stringify({ type: 'joined', peerId: userId, isCaller: isCaller }));
                     }
                 });
 
@@ -945,12 +947,12 @@ wss.on('connection', (ws) =>
                 {
                     if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN)
                     {
-                        ws.send(JSON.stringify({ type: 'joined', peerId: client.userId }));
+                        ws.send(JSON.stringify({ type: 'joined', peerId: client.userId, isCaller: !!client.isCaller }));
                     }
                 });
 
-                room.add({ ws, userId });
-                console.log(`[Join] Room: ${roomId}, User: ${userId}, Count: ${room.size}`);
+                room.add({ ws, userId, isCaller });
+                console.log(`[Join] Room: ${roomId}, User: ${userId}, isCaller: ${isCaller}, Count: ${room.size}`);
                 return;
             }
 
