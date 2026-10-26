@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 13時45分
+// 変更日時：2026年10月26日 18時40分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -206,7 +206,7 @@ function sendMailViaGas(gasUrl, mailData)
     });
 }
 
-// FCM高優先度着信プッシュ送信 (LINE同等の通知バー不要・完全バックグラウンド着信)
+// FCM高優先度着信データプッシュ送信 (LINE同等の完全バックグラウンド着信・アプリ終了時もonMessageReceivedを確実起動)
 async function sendIncomingCallPush(targetFcmToken, callData)
 {
     if (!firebaseApp || !admin)
@@ -223,30 +223,22 @@ async function sendIncomingCallPush(targetFcmToken, callData)
     {
         const message = {
             token: targetFcmToken,
-            notification: {
-                title: `${callData.fromName || '通話相手'} から着信`,
-                body: '通話の着信中…'
-            },
             data: {
                 type: 'incoming_call',
-                fromUserId: callData.fromUserId || '',
-                fromName: callData.fromName || '通話相手',
-                roomId: callData.roomId || ''
+                fromUserId: String(callData.fromUserId || ''),
+                fromName: String(callData.fromName || '通話相手'),
+                roomId: String(callData.roomId || ''),
+                isVideo: String(callData.isVideo ? 'true' : 'false'),
+                timestamp: String(Date.now())
             },
             android: {
                 priority: 'high',
-                notification: {
-                    channelId: 'incoming_call_channel_v2',
-                    priority: 'max',
-                    defaultSound: true,
-                    defaultVibrateTimings: true
-                },
                 ttl: 60 * 1000 // 60秒有効
             }
         };
 
         const response = await admin.messaging().send(message);
-        console.log(`[FCM Push] 着信プッシュ送信完了 (${callData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+        console.log(`[FCM Push] 着信データプッシュ送信完了 (${callData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
         return true;
     }
     catch (err)
@@ -322,7 +314,96 @@ function saveOfflineQueue()
 // 起動時にファイルから復元
 loadOfflineQueue();
 
-// FCM新着チャットプッシュ送信 (二重通知防止のためdataメッセージで統一・暗号化本文を完全伝送)
+// FCMデバイストークン永続化ファイル
+const FCM_TOKENS_FILE = path.join(__dirname, 'fcm_tokens.json');
+
+function saveFcmTokens()
+{
+    try
+    {
+        const obj = {};
+        for (const [k, v] of fcmTokenStore.entries())
+        {
+            obj[k] = v;
+        }
+        fs.writeFileSync(FCM_TOKENS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    }
+    catch (e)
+    {
+        console.error('[FCM Store] トークン保存エラー:', e.message);
+    }
+}
+
+function loadFcmTokens()
+{
+    try
+    {
+        if (fs.existsSync(FCM_TOKENS_FILE))
+        {
+            const data = fs.readFileSync(FCM_TOKENS_FILE, 'utf8');
+            const obj = JSON.parse(data);
+            for (const [k, v] of Object.entries(obj))
+            {
+                fcmTokenStore.set(k, v);
+            }
+            console.log(`[FCM Store] トークンファイルから ${fcmTokenStore.size} 件のFCMトークンを復元完了`);
+        }
+    }
+    catch (e)
+    {
+        console.error('[FCM Store] トークン復元エラー:', e.message);
+    }
+}
+
+// 起動時にFCMトークンをファイルから復元
+loadFcmTokens();
+
+// オフライン既読通知ストア (targetUserId -> [ { fromUserId, messageIds, timestamp } ])
+const offlineReadQueue = new Map();
+const OFFLINE_READS_FILE = path.join(__dirname, 'offline_reads.json');
+
+function saveOfflineReads()
+{
+    try
+    {
+        const obj = {};
+        for (const [k, v] of offlineReadQueue.entries())
+        {
+            obj[k] = v;
+        }
+        fs.writeFileSync(OFFLINE_READS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    }
+    catch (e)
+    {
+        console.error('[Offline Read Store] 保存エラー:', e.message);
+    }
+}
+
+function loadOfflineReads()
+{
+    try
+    {
+        if (fs.existsSync(OFFLINE_READS_FILE))
+        {
+            const data = fs.readFileSync(OFFLINE_READS_FILE, 'utf8');
+            const obj = JSON.parse(data);
+            for (const [k, v] of Object.entries(obj))
+            {
+                offlineReadQueue.set(k, v);
+            }
+            console.log(`[Offline Read Store] 保留既読ファイルから ${offlineReadQueue.size} ユーザーの通知を復元完了`);
+        }
+    }
+    catch (e)
+    {
+        console.error('[Offline Read Store] 復元エラー:', e.message);
+    }
+}
+
+// 起動時に保留既読通知を復元
+loadOfflineReads();
+
+// FCM新着チャットプッシュ送信 (二重通知防止のためdataメッセージで統一・暗号化本文＆添付ファイル情報を完全伝送)
 async function sendChatMessagePush(targetFcmToken, chatData)
 {
     if (!firebaseApp || !admin)
@@ -349,6 +430,10 @@ async function sendChatMessagePush(targetFcmToken, chatData)
                 iv: String(chatData.iv || ''),
                 cipher: String(chatData.cipher || ''),
                 imageBase64: String(chatData.imageBase64 || ''),
+                fileUrl: String(chatData.fileUrl || ''),
+                fileKey: String(chatData.fileKey || ''),
+                fileName: String(chatData.fileName || ''),
+                fileSize: String(chatData.fileSize || '0'),
                 timestamp: String(chatData.timestamp || Date.now())
             },
             android: {
@@ -683,6 +768,7 @@ const server = http.createServer(async (req, res) =>
             }
 
             fcmTokenStore.set(userId, { fcmToken, email, updatedAt: Date.now() });
+            saveFcmTokens();
             console.log(`[FCM Token] 登録成功: ${userId} (${email}) -> ${fcmToken.slice(0, 15)}...`);
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -713,23 +799,162 @@ const server = http.createServer(async (req, res) =>
             }
 
             const messages = offlineMessageQueue.get(targetUserId) || [];
-            // 取得完了したためキューから削除しファイル永続化
             offlineMessageQueue.delete(targetUserId);
             saveOfflineQueue();
 
-            console.log(`[Chat Pending API] ${targetUserId} へ保留メッセージ ${messages.length}件を一括返却・クリア`);
+            const readReceipts = offlineReadQueue.get(targetUserId) || [];
+            offlineReadQueue.delete(targetUserId);
+            saveOfflineReads();
+
+            console.log(`[Chat Pending API] ${targetUserId} へ保留メッセージ ${messages.length}件、既読通知 ${readReceipts.length}バッチを一括返却・クリア`);
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({
                 success: true,
                 userId: targetUserId,
                 count: messages.length,
-                messages: messages
+                messages: messages,
+                readReceipts: readReceipts
             }));
             return;
         }
         catch (err)
         {
             console.error('[Chat Pending API Error]', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
+    }
+
+    // [API 5] 既読通知受信 (HTTPフォールバック対応: WebSocket未接続・切断時でも確実に既読を記録＆中継)
+    if (req.method === 'POST' && url === '/api/chat/read')
+    {
+        try
+        {
+            const body = await parseJsonBody(req);
+            const fromUserId = (body.fromUserId || '').trim();
+            const targetUserId = (body.targetUserId || '').trim();
+            const messageIds = Array.isArray(body.messageIds) ? body.messageIds : [];
+
+            if (!fromUserId || !targetUserId || messageIds.length === 0)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
+                return;
+            }
+
+            const targetEntry = users.get(targetUserId);
+            let forwarded = false;
+            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
+            {
+                targetEntry.ws.send(JSON.stringify({
+                    type: 'chat_read',
+                    fromUserId: fromUserId,
+                    targetUserId: targetUserId,
+                    messageIds: messageIds
+                }));
+                forwarded = true;
+                console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS中継完了)`);
+            }
+
+            if (!forwarded)
+            {
+                if (!offlineReadQueue.has(targetUserId))
+                {
+                    offlineReadQueue.set(targetUserId, []);
+                }
+                const rq = offlineReadQueue.get(targetUserId);
+                rq.push({
+                    fromUserId: fromUserId,
+                    targetUserId: targetUserId,
+                    messageIds: messageIds
+                });
+                if (rq.length > 200) { rq.shift(); }
+                saveOfflineReads();
+                console.log(`[HTTP Chat Read Offline] 相手(${targetUserId})オフラインのため既読通知をキュー保管 (保留計: ${rq.length}件)`);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, forwarded: forwarded }));
+            return;
+        }
+        catch (err)
+        {
+            console.error('[HTTP Chat Read Error]', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
+    }
+
+    // [API 6] チャットメッセージ送信 (HTTPフォールバック対応: WebSocket切断時・未接続時でも確実に相手へ中継＆プッシュ送信)
+    if (req.method === 'POST' && url === '/api/chat/send')
+    {
+        try
+        {
+            const data = await parseJsonBody(req);
+            const fromUserId = (data.fromUserId || '').trim();
+            const targetUserId = (data.targetUserId || '').trim();
+
+            if (!fromUserId || !targetUserId || !data.messageId)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
+                return;
+            }
+
+            const targetEntry = users.get(targetUserId);
+            const senderName = users.get(fromUserId)?.name || data.fromName || '友だち';
+
+            // 1. WebSocketがアクティブなら即座に直接中継
+            let sentViaWs = false;
+            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
+            {
+                targetEntry.ws.send(JSON.stringify(data));
+                sentViaWs = true;
+                console.log(`[HTTP Chat] Forwarded message from ${fromUserId} to ${targetUserId} via WebSocket`);
+            }
+            else
+            {
+                // 相手がオフラインの場合: サーバー側キューに一時保管
+                if (!offlineMessageQueue.has(targetUserId))
+                {
+                    offlineMessageQueue.set(targetUserId, []);
+                }
+                const queue = offlineMessageQueue.get(targetUserId);
+                queue.push(data);
+                if (queue.length > 100) { queue.shift(); }
+                saveOfflineQueue();
+                console.log(`[HTTP Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
+            }
+
+            // 2. FCMプッシュ送信
+            const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
+            if (targetFcm && targetFcm.fcmToken)
+            {
+                sendChatMessagePush(targetFcm.fcmToken, {
+                    fromUserId: fromUserId,
+                    fromName: senderName,
+                    messageId: data.messageId,
+                    text: data.text || '',
+                    iv: data.iv || '',
+                    cipher: data.cipher || '',
+                    imageBase64: data.imageBase64 || '',
+                    fileUrl: data.fileUrl || '',
+                    fileKey: data.fileKey || '',
+                    fileName: data.fileName || '',
+                    fileSize: data.fileSize || '0',
+                    timestamp: data.timestamp || Date.now()
+                });
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, messageId: data.messageId, sentViaWs: sentViaWs }));
+            return;
+        }
+        catch (err)
+        {
+            console.error('[HTTP Chat Send API Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
             return;
@@ -856,6 +1081,30 @@ wss.on('connection', (ws) =>
                     offlineMessageQueue.delete(userId);
                     saveOfflineQueue();
                 }
+
+                // 保留されていたオフライン既読通知があれば一括配信！
+                if (offlineReadQueue.has(userId))
+                {
+                    const queuedReads = offlineReadQueue.get(userId) || [];
+                    if (queuedReads.length > 0)
+                    {
+                        console.log(`[Offline Read Queue] 待受復帰した ${userId} へ保留既読通知 ${queuedReads.length}件を一括配信`);
+                        if (ws.readyState === WebSocket.OPEN)
+                        {
+                            for (const r of queuedReads)
+                            {
+                                ws.send(JSON.stringify({
+                                    type: 'chat_read',
+                                    fromUserId: r.fromUserId,
+                                    targetUserId: r.targetUserId,
+                                    messageIds: r.messageIds
+                                }));
+                            }
+                        }
+                    }
+                    offlineReadQueue.delete(userId);
+                    saveOfflineReads();
+                }
                 return;
             }
 
@@ -872,7 +1121,8 @@ wss.on('connection', (ws) =>
                         type: 'incoming_call',
                         fromUserId: data.fromUserId,
                         fromName: data.fromName,
-                        roomId: data.roomId
+                        roomId: data.roomId,
+                        isVideo: data.isVideo === true || data.isVideo === 'true'
                     }));
                     console.log(`[Call Invite] Forwarded via WebSocket from ${data.fromUserId} to ${targetUserId}`);
                     forwardedViaWs = true;
@@ -886,7 +1136,8 @@ wss.on('connection', (ws) =>
                     sendIncomingCallPush(targetFcm.fcmToken, {
                         fromUserId: data.fromUserId,
                         fromName: data.fromName,
-                        roomId: data.roomId
+                        roomId: data.roomId,
+                        isVideo: data.isVideo === true || data.isVideo === 'true'
                     });
                 }
                 else if (!forwardedViaWs)
@@ -930,9 +1181,12 @@ wss.on('connection', (ws) =>
                 const targetEntry = users.get(targetUserId);
                 const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
 
+                // 1. WebSocketがアクティブなら即座に直接中継
+                let sentViaWs = false;
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
                     targetEntry.ws.send(JSON.stringify(data));
+                    sentViaWs = true;
                     console.log(`[E2EE Chat] Forwarded encrypted message from ${data.fromUserId} to ${targetUserId}`);
                 }
                 else
@@ -948,27 +1202,31 @@ wss.on('connection', (ws) =>
                     saveOfflineQueue();
 
                     console.log(`[E2EE Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
+                }
 
-                    // 相手の端末へFCM高優先度新着プッシュを送信！
-                    const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
-                    if (targetFcm && targetFcm.fcmToken)
-                    {
-                        console.log(`[FCM Chat Push] 相手(${targetUserId})のFCMトークン検知。プッシュ送信実行`);
-                        sendChatMessagePush(targetFcm.fcmToken, {
-                            fromUserId: data.fromUserId,
-                            fromName: senderName,
-                            messageId: data.messageId,
-                            text: data.text || '',
-                            iv: data.iv || '',
-                            cipher: data.cipher || '',
-                            imageBase64: data.imageBase64 || '',
-                            timestamp: data.timestamp || Date.now()
-                        });
-                    }
-                    else
-                    {
-                        console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
-                    }
+                // 2. アプリを閉じている・バックグラウンド・画面OFF時でも確実に届くようFCM高優先度新着プッシュを常に送信！
+                const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
+                if (targetFcm && targetFcm.fcmToken)
+                {
+                    console.log(`[FCM Chat Push] 相手(${targetUserId})へ高優先度チャットプッシュ送信実行`);
+                    sendChatMessagePush(targetFcm.fcmToken, {
+                        fromUserId: data.fromUserId,
+                        fromName: senderName,
+                        messageId: data.messageId,
+                        text: data.text || '',
+                        iv: data.iv || '',
+                        cipher: data.cipher || '',
+                        imageBase64: data.imageBase64 || '',
+                        fileUrl: data.fileUrl || '',
+                        fileKey: data.fileKey || '',
+                        fileName: data.fileName || '',
+                        fileSize: data.fileSize || '0',
+                        timestamp: data.timestamp || Date.now()
+                    });
+                }
+                else
+                {
+                    console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
                 }
 
                 // 送信元へ受領ACK返送 (送信成功チェックマーク用)
@@ -983,7 +1241,7 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 既読通知中継 (なりすまし検証付き)
+            // 既読通知中継 (なりすまし検証 ＆ オフライン永続キュー連動)
             if (type === 'chat_read')
             {
                 if (currentUserId && data.fromUserId !== currentUserId)
@@ -994,10 +1252,30 @@ wss.on('connection', (ws) =>
 
                 const targetUserId = data.targetUserId;
                 const targetEntry = users.get(targetUserId);
+                let forwarded = false;
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
                     targetEntry.ws.send(JSON.stringify(data));
+                    forwarded = true;
                     console.log(`[Chat Read] ${data.fromUserId} read messages of ${targetUserId}`);
+                }
+
+                // 相手がオフライン(WebSocket切断中)の場合、相手が後でアプリ起動/画面表示した時に同期できるようキューに蓄積
+                if (!forwarded)
+                {
+                    if (!offlineReadQueue.has(targetUserId))
+                    {
+                        offlineReadQueue.set(targetUserId, []);
+                    }
+                    const rq = offlineReadQueue.get(targetUserId);
+                    rq.push({
+                        fromUserId: data.fromUserId,
+                        targetUserId: data.targetUserId,
+                        messageIds: data.messageIds || data.ids || []
+                    });
+                    if (rq.length > 200) { rq.shift(); }
+                    saveOfflineReads();
+                    console.log(`[Chat Read Offline] 相手(${targetUserId})オフラインのため既読通知をキュー保管 (保留計: ${rq.length}件)`);
                 }
                 return;
             }
