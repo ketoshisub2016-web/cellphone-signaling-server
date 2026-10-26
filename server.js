@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 12時22分
+// 変更日時：2026年10月26日 12時38分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -7,6 +7,7 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 let admin = null;
 let firebaseApp = null;
@@ -255,8 +256,71 @@ async function sendIncomingCallPush(targetFcmToken, callData)
     }
 }
 
-// オフラインチャットメッセージ一時保管キュー (targetUserId -> [ messageData ])
+// オフラインチャットメッセージ永続化キュー (targetUserId -> [ messageData ])
 const offlineMessageQueue = new Map();
+const QUEUE_FILE_PATH = path.join(__dirname, 'data', 'offline_queue.json');
+
+// オフラインキューの永続化ファイルからのロード
+function loadOfflineQueue()
+{
+    try
+    {
+        if (fs.existsSync(QUEUE_FILE_PATH))
+        {
+            const data = fs.readFileSync(QUEUE_FILE_PATH, 'utf8');
+            const obj = JSON.parse(data);
+            for (const [userId, messages] of Object.entries(obj))
+            {
+                if (Array.isArray(messages) && messages.length > 0)
+                {
+                    offlineMessageQueue.set(userId, messages);
+                }
+            }
+            console.log(`[Offline Queue] 永続化ファイルから ${offlineMessageQueue.size} ユーザー分のキューを復元完了`);
+        }
+    }
+    catch (err)
+    {
+        console.error('[Offline Queue Load Error]', err.message);
+    }
+}
+
+// オフラインキューのファイル保存 (非同期・デバウンス)
+let saveQueueTimer = null;
+function saveOfflineQueue()
+{
+    if (saveQueueTimer)
+    {
+        clearTimeout(saveQueueTimer);
+    }
+    saveQueueTimer = setTimeout(() =>
+    {
+        try
+        {
+            const dir = path.dirname(QUEUE_FILE_PATH);
+            if (!fs.existsSync(dir))
+            {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+            const obj = {};
+            for (const [userId, messages] of offlineMessageQueue.entries())
+            {
+                if (messages && messages.length > 0)
+                {
+                    obj[userId] = messages;
+                }
+            }
+            fs.writeFileSync(QUEUE_FILE_PATH, JSON.stringify(obj, null, 2), 'utf8');
+        }
+        catch (err)
+        {
+            console.error('[Offline Queue Save Error]', err.message);
+        }
+    }, 200);
+}
+
+// 起動時にファイルから復元
+loadOfflineQueue();
 
 // FCM新着チャットプッシュ送信 (二重通知防止のためdataメッセージで統一・暗号化本文を完全伝送)
 async function sendChatMessagePush(targetFcmToken, chatData)
@@ -634,6 +698,44 @@ const server = http.createServer(async (req, res) =>
         }
     }
 
+    // [API 4] 保留チャットメッセージ一括取得 (アプリ未起動分・オフライン分の一括読み込み)
+    const parsedReqUrl = new URL(url, 'http://localhost');
+    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/pending')
+    {
+        try
+        {
+            const targetUserId = (parsedReqUrl.searchParams.get('userId') || '').trim();
+            if (!targetUserId)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
+                return;
+            }
+
+            const messages = offlineMessageQueue.get(targetUserId) || [];
+            // 取得完了したためキューから削除しファイル永続化
+            offlineMessageQueue.delete(targetUserId);
+            saveOfflineQueue();
+
+            console.log(`[Chat Pending API] ${targetUserId} へ保留メッセージ ${messages.length}件を一括返却・クリア`);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                success: true,
+                userId: targetUserId,
+                count: messages.length,
+                messages: messages
+            }));
+            return;
+        }
+        catch (err)
+        {
+            console.error('[Chat Pending API Error]', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
+    }
+
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not Found');
 });
@@ -701,7 +803,7 @@ wss.on('connection', (ws) =>
     {
         try
         {
-            // レートリミット検査 (連打・DoS防御)
+            // レートリミット検査 (連打・DoS防御: チャット連続送信対応で30通/秒まで許容)
             const now = Date.now();
             if (now - ws.rateLimitWindowStart > 1000)
             {
@@ -709,7 +811,7 @@ wss.on('connection', (ws) =>
                 ws.messageCountInWindow = 0;
             }
             ws.messageCountInWindow++;
-            if (ws.messageCountInWindow > 8)
+            if (ws.messageCountInWindow > 30)
             {
                 console.warn(`[Rate Limit Exceeded] メッセージ過剰送信をドロップ: ${currentUserId || 'unknown'}`);
                 return;
@@ -735,25 +837,24 @@ wss.on('connection', (ws) =>
                 console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
                 ws.send(JSON.stringify({ type: 'registered', userId: userId }));
 
-                // 保留されていたオフラインメッセージがあれば順次安全配信！
+                // 保留されていたオフラインメッセージがあれば一括バッチ配信！
                 if (offlineMessageQueue.has(userId))
                 {
                     const queuedMessages = offlineMessageQueue.get(userId) || [];
                     if (queuedMessages.length > 0)
                     {
-                        console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を順次配信`);
-                        queuedMessages.forEach((msgData, idx) =>
+                        console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を一括バッチ配信`);
+                        if (ws.readyState === WebSocket.OPEN)
                         {
-                            setTimeout(() =>
-                            {
-                                if (ws.readyState === WebSocket.OPEN)
-                                {
-                                    ws.send(JSON.stringify(msgData));
-                                }
-                            }, idx * 100);
-                        });
+                            ws.send(JSON.stringify({
+                                type: 'chat_messages_batch',
+                                targetUserId: userId,
+                                messages: queuedMessages
+                            }));
+                        }
                     }
                     offlineMessageQueue.delete(userId);
+                    saveOfflineQueue();
                 }
                 return;
             }
@@ -843,7 +944,8 @@ wss.on('connection', (ws) =>
                     }
                     const queue = offlineMessageQueue.get(targetUserId);
                     queue.push(data);
-                    if (queue.length > 50) { queue.shift(); } // 最大50件保持
+                    if (queue.length > 100) { queue.shift(); } // 最大100件保持
+                    saveOfflineQueue();
 
                     console.log(`[E2EE Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
 
