@@ -1,4 +1,4 @@
-// 変更日時：2026年10月24日 15時25分
+// 変更日時：2026年10月26日 12時22分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -956,9 +956,15 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 通話制御・メディア同期メッセージ
+            // 通話制御・メディア同期メッセージ (巨大SDPインジェクションDoS防御: 64KB上限)
             if (['offer', 'answer', 'candidate', 'avatar_sync'].includes(type))
             {
+                if (message.length > 64 * 1024)
+                {
+                    console.warn(`[Security Block] 許容サイズ(64KB)超過のシグナリングパケットを破棄: ${type} (${message.length} bytes)`);
+                    return;
+                }
+
                 if (currentRoomId && rooms.has(currentRoomId))
                 {
                     const room = rooms.get(currentRoomId);
