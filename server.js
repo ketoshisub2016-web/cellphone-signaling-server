@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 12時38分
+// 変更日時：2026年10月26日 13時10分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -969,6 +969,16 @@ wss.on('connection', (ws) =>
                     {
                         console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
                     }
+                }
+
+                // 送信元へ受領ACK返送 (送信成功チェックマーク用)
+                if (ws.readyState === WebSocket.OPEN)
+                {
+                    ws.send(JSON.stringify({
+                        type: 'chat_sent_ack',
+                        messageId: data.messageId,
+                        timestamp: Date.now()
+                    }));
                 }
                 return;
             }
