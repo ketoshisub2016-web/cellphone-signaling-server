@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 22時45分
+// 変更日時：2026年10月26日 20時15分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -854,25 +854,24 @@ const server = http.createServer(async (req, res) =>
                     messageIds: messageIds
                 }));
                 forwarded = true;
-                console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS中継完了)`);
+                console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS即時中継)`);
             }
 
-            if (!forwarded)
+            // ゴースト切断や再接続・後から画面表示時にも確実に既読を反映できるよう、キューにも常に保管
+            if (!offlineReadQueue.has(targetUserId))
             {
-                if (!offlineReadQueue.has(targetUserId))
-                {
-                    offlineReadQueue.set(targetUserId, []);
-                }
-                const rq = offlineReadQueue.get(targetUserId);
-                rq.push({
-                    fromUserId: fromUserId,
-                    targetUserId: targetUserId,
-                    messageIds: messageIds
-                });
-                if (rq.length > 200) { rq.shift(); }
-                saveOfflineReads();
-                console.log(`[HTTP Chat Read Offline] 相手(${targetUserId})オフラインのため既読通知をキュー保管 (保留計: ${rq.length}件)`);
+                offlineReadQueue.set(targetUserId, []);
             }
+            const rq = offlineReadQueue.get(targetUserId);
+            rq.push({
+                fromUserId: fromUserId,
+                targetUserId: targetUserId,
+                messageIds: messageIds,
+                timestamp: Date.now()
+            });
+            if (rq.length > 300) { rq.shift(); }
+            saveOfflineReads();
+            console.log(`[HTTP Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー二重保持 (保留計: ${rq.length}件, WS即時=${forwarded})`);
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ success: true, forwarded: forwarded }));
@@ -1329,42 +1328,54 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 既読通知中継 (なりすまし検証 ＆ オフライン永続キュー連動)
+            // 既読通知中継 (なりすまし自動補正 ＆ WebSocket即時中継 ＆ オフライン永続キュー二重連動)
             if (type === 'chat_read')
             {
-                if (currentUserId && data.fromUserId !== currentUserId)
+                const senderUid = (data.fromUserId || '').trim();
+                const regUid = (currentUserId || '').trim();
+                if (regUid && senderUid && senderUid !== regUid)
                 {
-                    console.warn(`[Security Block] 既読通知の送信元UID偽装を遮断: registered=${currentUserId}, packet=${data.fromUserId}`);
+                    console.warn(`[Security Auto-heal] 既読送信元UID補正: registered=${regUid}, packet=${senderUid}`);
+                    data.fromUserId = regUid;
+                }
+                const fromUserId = data.fromUserId || regUid;
+                const targetUserId = (data.targetUserId || data.targetId || '').trim();
+                const messageIds = Array.isArray(data.messageIds) ? data.messageIds : (Array.isArray(data.ids) ? data.ids : []);
+
+                if (!targetUserId || messageIds.length === 0)
+                {
                     return;
                 }
 
-                const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
                 let forwarded = false;
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
-                    targetEntry.ws.send(JSON.stringify(data));
+                    targetEntry.ws.send(JSON.stringify({
+                        type: 'chat_read',
+                        fromUserId: fromUserId,
+                        targetUserId: targetUserId,
+                        messageIds: messageIds
+                    }));
                     forwarded = true;
-                    console.log(`[Chat Read] ${data.fromUserId} read messages of ${targetUserId}`);
+                    console.log(`[WS Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS即時中継)`);
                 }
 
-                // 相手がオフライン(WebSocket切断中)の場合、相手が後でアプリ起動/画面表示した時に同期できるようキューに蓄積
-                if (!forwarded)
+                // 相手がオフラインやゴースト切断時、または後からチャットを開いた時でも確実に同期できるようキューに常時二重保管
+                if (!offlineReadQueue.has(targetUserId))
                 {
-                    if (!offlineReadQueue.has(targetUserId))
-                    {
-                        offlineReadQueue.set(targetUserId, []);
-                    }
-                    const rq = offlineReadQueue.get(targetUserId);
-                    rq.push({
-                        fromUserId: data.fromUserId,
-                        targetUserId: data.targetUserId,
-                        messageIds: data.messageIds || data.ids || []
-                    });
-                    if (rq.length > 200) { rq.shift(); }
-                    saveOfflineReads();
-                    console.log(`[Chat Read Offline] 相手(${targetUserId})オフラインのため既読通知をキュー保管 (保留計: ${rq.length}件)`);
+                    offlineReadQueue.set(targetUserId, []);
                 }
+                const rq = offlineReadQueue.get(targetUserId);
+                rq.push({
+                    fromUserId: fromUserId,
+                    targetUserId: targetUserId,
+                    messageIds: messageIds,
+                    timestamp: Date.now()
+                });
+                if (rq.length > 300) { rq.shift(); }
+                saveOfflineReads();
+                console.log(`[WS Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー保持 (保留計: ${rq.length}件, WS即時=${forwarded})`);
                 return;
             }
 
