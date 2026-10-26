@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 18時40分
+// 変更日時：2026年10月26日 22時30分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -894,7 +894,7 @@ const server = http.createServer(async (req, res) =>
         {
             const data = await parseJsonBody(req);
             const fromUserId = (data.fromUserId || '').trim();
-            const targetUserId = (data.targetUserId || '').trim();
+            const targetUserId = (data.targetUserId || data.targetId || '').trim();
 
             if (!fromUserId || !targetUserId || !data.messageId)
             {
@@ -1111,7 +1111,7 @@ wss.on('connection', (ws) =>
             // 着信コール通知 (WebSocket中継 ＆ FCM高優先度プッシュ二重化同時送信)
             if (type === 'call_invite')
             {
-                const targetUserId = data.targetUserId;
+                const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
 
                 let forwardedViaWs = false;
@@ -1151,7 +1151,7 @@ wss.on('connection', (ws) =>
             // 着信拒否・切断・キャンセル
             if (type === 'call_cancel' || type === 'call_decline')
             {
-                const targetUserId = data.targetUserId;
+                const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
                 {
@@ -1177,7 +1177,7 @@ wss.on('connection', (ws) =>
                     return;
                 }
 
-                const targetUserId = data.targetUserId;
+                const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
                 const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
 
@@ -1250,7 +1250,7 @@ wss.on('connection', (ws) =>
                     return;
                 }
 
-                const targetUserId = data.targetUserId;
+                const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
                 let forwarded = false;
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
