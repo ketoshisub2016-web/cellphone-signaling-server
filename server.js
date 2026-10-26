@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 22時30分
+// 変更日時：2026年10月26日 22時45分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -959,6 +959,94 @@ const server = http.createServer(async (req, res) =>
             res.end(JSON.stringify({ success: false, error: err.message }));
             return;
         }
+    }
+
+    // [API 7] 暗号化ファイル直接アップロード (E2EEファイル転送: 外部依存完全撤廃・高信頼ストリーミング)
+    if (req.method === 'POST' && url === '/api/file/upload')
+    {
+        try
+        {
+            const UPLOAD_DIR = path.join(__dirname, 'uploads');
+            if (!fs.existsSync(UPLOAD_DIR))
+            {
+                fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+            }
+
+            const fileId = 'enc_' + crypto.randomBytes(16).toString('hex');
+            const savePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
+            const writeStream = fs.createWriteStream(savePath);
+
+            let uploadedBytes = 0;
+            const maxLimit = 150 * 1024 * 1024; // 150MB
+
+            req.on('data', (chunk) => {
+                uploadedBytes += chunk.length;
+                if (uploadedBytes > maxLimit)
+                {
+                    writeStream.destroy();
+                    if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); }
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'ファイルサイズが上限(150MB)を超えています' }));
+                    req.destroy();
+                }
+            });
+
+            req.pipe(writeStream);
+
+            writeStream.on('finish', () => {
+                const host = req.headers['host'] || 'localhost:3000';
+                const protocol = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
+                const downloadUrl = `${protocol}://${host}/api/file/download/${fileId}`;
+                console.log(`[File Upload] 暗号化ファイルを正常保管: ${fileId} (${uploadedBytes} bytes) -> ${downloadUrl}`);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({
+                    success: true,
+                    fileId: fileId,
+                    url: downloadUrl,
+                    size: uploadedBytes
+                }));
+            });
+
+            writeStream.on('error', (err) => {
+                console.error('[File Upload Error]', err);
+                if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); }
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'ファイル書き込みエラー: ' + err.message }));
+            });
+            return;
+        }
+        catch (err)
+        {
+            console.error('[File Upload Exception]', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
+    }
+
+    // [API 8] 暗号化ファイル直接ダウンロード (生のバイナリを高速・確実に返却)
+    if (req.method === 'GET' && url.startsWith('/api/file/download/'))
+    {
+        const UPLOAD_DIR = path.join(__dirname, 'uploads');
+        const fileId = path.basename(url);
+        const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
+        if (!fs.existsSync(filePath))
+        {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('File not found or expired');
+            return;
+        }
+
+        const stat = fs.statSync(filePath);
+        res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': stat.size,
+            'Content-Disposition': `attachment; filename="${fileId}.bin"`,
+            'Cache-Control': 'no-cache'
+        });
+        const readStream = fs.createReadStream(filePath);
+        readStream.pipe(res);
+        return;
     }
 
     res.writeHead(404, { 'Content-Type': 'text/plain' });
