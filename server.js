@@ -1,4 +1,4 @@
-// 変更日時：2026年10月26日 20時15分
+// 変更日時：2026年10月28日 01時25分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -434,6 +434,7 @@ async function sendChatMessagePush(targetFcmToken, chatData)
                 fileKey: String(chatData.fileKey || ''),
                 fileName: String(chatData.fileName || ''),
                 fileSize: String(chatData.fileSize || '0'),
+                senderPubKey: String(chatData.senderPubKey || ''),
                 timestamp: String(chatData.timestamp || Date.now())
             },
             android: {
@@ -943,6 +944,7 @@ const server = http.createServer(async (req, res) =>
                     fileKey: data.fileKey || '',
                     fileName: data.fileName || '',
                     fileSize: data.fileSize || '0',
+                    senderPubKey: data.senderPubKey || '',
                     timestamp: data.timestamp || Date.now()
                 });
             }
@@ -1308,6 +1310,7 @@ wss.on('connection', (ws) =>
                         fileKey: data.fileKey || '',
                         fileName: data.fileName || '',
                         fileSize: data.fileSize || '0',
+                        senderPubKey: data.senderPubKey || '',
                         timestamp: data.timestamp || Date.now()
                     });
                 }
