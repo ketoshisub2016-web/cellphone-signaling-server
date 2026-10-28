@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 12時10分
+// 変更日時：2026年10月28日 12時35分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -687,16 +687,17 @@ const server = http.createServer(async (req, res) =>
             }
             emailOtpCooldownTracker.set(email, now);
 
-            // 6桁ランダムコード生成 (100000〜999999)
-            const code = Math.floor(100000 + Math.random() * 900000).toString();
+            // 6桁暗号論的ランダムコード生成 (100000〜999999 / crypto.randomInt)
+            const code = crypto.randomInt(100000, 1000000).toString();
             const expiresAt = now + 5 * 60 * 1000; // 5分間有効
             otpStore.set(email, { code, expiresAt, attempts: 0, lastSentAt: now });
 
             // 相互承認ルーティング: 送信先アドレスを特定
             const targetEmail = APPROVAL_ROUTING[email] || email;
             const maskedTarget = maskEmail(targetEmail);
+            const maskedCode = `${code.slice(0, 2)}****`;
 
-            console.log(`[Cross-Auth OTP] ログイン試行: ${email} -> 承認コード送信先: ${targetEmail} (${code})`);
+            console.log(`[Cross-Auth OTP] ログイン試行: ${email} -> 承認コード送信先: ${targetEmail} (${maskedCode})`);
 
             // メール本文テンプレート生成
             const mailSubject = `【CellPhone App】${email} からのログイン承認要求`;
@@ -909,12 +910,12 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            // セッショントークン検証 (他人によるプッシュ妨害上書きを遮断)
-            if (token && !isValidSession(token, userId))
+            // セッショントークン検証 (他人によるプッシュ妨害上書きを遮断: 必須化)
+            if (!token || !isValidSession(token, userId))
             {
-                console.warn(`[Security Block] 不正トークンによるFCM登録を拒絶: ${userId}`);
+                console.warn(`[Security Block] 未認証または不正トークンによるFCM登録を拒絶: ${userId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return;
             }
 
@@ -951,12 +952,12 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            // セッショントークン認証 (他人のキュー横取り・削除を完全遮断)
-            if (token && !isValidSession(token, targetUserId))
+            // セッショントークン認証 (他人のキュー横取り・削除を完全遮断: 必須化)
+            if (!token || !isValidSession(token, targetUserId))
             {
-                console.warn(`[Security Block] 不正トークンによる保留メッセージ取得を遮断: ${targetUserId}`);
+                console.warn(`[Security Block] 未認証または不正トークンによる保留メッセージ取得を遮断: ${targetUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return;
             }
 
@@ -1006,12 +1007,12 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            // セッショントークン検証 (他人を騙る既読送信を遮断)
-            if (token && !isValidSession(token, fromUserId))
+            // セッショントークン検証 (他人を騙る既読送信を遮断: 必須化)
+            if (!token || !isValidSession(token, fromUserId))
             {
-                console.warn(`[Security Block] 不正トークンによる既読送信を遮断: ${fromUserId}`);
+                console.warn(`[Security Block] 未認証または不正トークンによる既読送信を遮断: ${fromUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return;
             }
 
@@ -1075,12 +1076,12 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            // セッショントークン検証 (送信者UID偽装を100%遮断)
-            if (token && !isValidSession(token, fromUserId))
+            // セッショントークン検証 (送信者UID偽装を100%遮断: 必須化)
+            if (!token || !isValidSession(token, fromUserId))
             {
-                console.warn(`[Security Block] 不正トークンによるメッセージ送信を遮断: ${fromUserId}`);
+                console.warn(`[Security Block] 未認証または不正トークンによるメッセージ送信を遮断: ${fromUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return;
             }
 
@@ -1374,6 +1375,7 @@ wss.on('connection', (ws) =>
                 }
 
                 currentUserId = userId;
+                ws.userId = userId;
                 users.set(userId, { ws, name: data.name || '友だち', token: token });
                 console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
                 ws.send(JSON.stringify({ type: 'registered', userId: userId }));
@@ -1432,6 +1434,18 @@ wss.on('connection', (ws) =>
                 const timestamp = Number(data.timestamp) || 0;
                 const nonce = (data.nonce || '').trim();
 
+                // 0. 発信元認証検証 (未認証WebSocketからの偽装着信・FCM DoS攻撃を完全遮断)
+                const callerUid = ws.userId || currentUserId;
+                if (!callerUid || (fromUserId && callerUid !== fromUserId))
+                {
+                    console.warn(`[Call Invite Rejected] 未認証またはUID不一致の着信要求: callerUid=${callerUid}, fromUserId=${fromUserId}`);
+                    if (ws.readyState === WebSocket.OPEN)
+                    {
+                        ws.send(JSON.stringify({ type: 'auth_error', message: '未認証の接続から着信を発信することはできません' }));
+                    }
+                    return;
+                }
+
                 // 1. タイムスタンプ鮮度検証 (35秒以内。時計ズレ考慮)
                 const now = Date.now();
                 if (timestamp > 0)
@@ -1454,13 +1468,6 @@ wss.on('connection', (ws) =>
                     }
                     seenInviteNonces.add(nonce);
                     setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
-                }
-
-                // 3. 送信者UID成りすまし検証
-                if (ws.userId && fromUserId && ws.userId !== fromUserId)
-                {
-                    console.warn(`[Call Invite Rejected] 送信者UID成りすまし: ws.userId=${ws.userId}, fromUserId=${fromUserId}`);
-                    return;
                 }
 
                 const targetEntry = users.get(targetUserId);
@@ -1503,9 +1510,15 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 着信拒否・切断・キャンセル
+            // 着信拒否・切断・キャンセル (送信元UID検証)
             if (type === 'call_cancel' || type === 'call_decline')
             {
+                const callerUid = ws.userId || currentUserId;
+                if (callerUid && data.fromUserId && callerUid !== data.fromUserId)
+                {
+                    console.warn(`[Call Cancel Block] 送信元UID不一致の切断要求を破棄: auth=${callerUid}, packet=${data.fromUserId}`);
+                    return;
+                }
                 const targetUserId = data.targetUserId || data.targetId;
                 const targetEntry = users.get(targetUserId);
                 if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
@@ -1662,6 +1675,7 @@ wss.on('connection', (ws) =>
 
                 currentRoomId = roomId;
                 currentUserId = userId;
+                ws.userId = userId;
                 if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
                 const room = rooms.get(roomId);
 
