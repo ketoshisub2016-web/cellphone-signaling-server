@@ -339,7 +339,8 @@ async function sendIncomingCallPush(targetFcmToken, callData)
                 fromName: String(callData.fromName || '通話相手'),
                 roomId: String(callData.roomId || ''),
                 isVideo: String(callData.isVideo ? 'true' : 'false'),
-                timestamp: String(Date.now())
+                timestamp: String(Date.now()),
+                nonce: crypto.randomBytes(8).toString('hex')
             },
             android: {
                 priority: 'high',
@@ -1515,7 +1516,7 @@ wss.on('connection', (ws) =>
             }
 
             // チャットメッセージ中継 (E2EE暗号文転送 ＆ オフラインキューイング ＆ FCM新着プッシュ連動)
-            if (type === 'chat_message')
+            if (['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(type))
             {
                 // 送信者UID偽装チェック
                 if (currentUserId && data.fromUserId !== currentUserId)
