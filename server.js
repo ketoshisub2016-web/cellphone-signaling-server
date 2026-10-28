@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 16時45分
+// 変更日時：2026年10月28日 17時20分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -1235,9 +1235,11 @@ const server = http.createServer(async (req, res) =>
             const data = await parseJsonBody(req);
             const fromUserId = (data.fromUserId || '').trim();
             const targetUserId = (data.targetUserId || data.targetId || '').trim();
+            const pktType = data.type || 'chat_message';
+            const isKeyPacket = (pktType === 'chat_key_ping' || pktType === 'chat_key_pong');
             const token = extractBearerToken(req) || (data.token || '').trim();
 
-            if (!fromUserId || !targetUserId || !data.messageId)
+            if (!fromUserId || !targetUserId || (!isKeyPacket && !data.messageId))
             {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
@@ -1284,9 +1286,9 @@ const server = http.createServer(async (req, res) =>
                 console.log(`[HTTP Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
             }
 
-            // 2. FCMプッシュ送信
+            // 2. FCMプッシュ送信 (実際のチャットメッセージのみ送信し、鍵交換Pingでは通知を発火させない)
             const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
-            if (targetFcm && targetFcm.fcmToken)
+            if (!isKeyPacket && targetFcm && targetFcm.fcmToken)
             {
                 sendChatMessagePush(targetFcm.fcmToken, {
                     fromUserId: fromUserId,
@@ -1778,40 +1780,43 @@ wss.on('connection', (ws, req) =>
                     console.log(`[E2EE Chat Offline] 相手(${targetUserId})がオフラインのためキュー保管 (保留計: ${queue.length}件)`);
                 }
 
-                // 2. アプリを閉じている・バックグラウンド・画面OFF時でも確実に届くようFCM高優先度新着プッシュを常に送信！
-                const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
-                if (targetFcm && targetFcm.fcmToken)
+                // 2. アプリを閉じている・バックグラウンド・画面OFF時でも確実に届くようFCM高優先度新着プッシュを送信 (chat_messageのみ)
+                if (type === 'chat_message')
                 {
-                    console.log(`[FCM Chat Push] 相手(${targetUserId})へ高優先度チャットプッシュ送信実行`);
-                    sendChatMessagePush(targetFcm.fcmToken, {
-                        fromUserId: data.fromUserId,
-                        fromName: senderName,
-                        messageId: data.messageId,
-                        text: data.text || '',
-                        iv: data.iv || '',
-                        cipher: data.cipher || '',
-                        imageBase64: data.imageBase64 || '',
-                        fileUrl: data.fileUrl || '',
-                        fileKey: data.fileKey || '',
-                        fileName: data.fileName || '',
-                        fileSize: data.fileSize || '0',
-                        senderPubKey: data.senderPubKey || '',
-                        timestamp: data.timestamp || Date.now()
-                    });
-                }
-                else
-                {
-                    console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
-                }
+                    const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
+                    if (targetFcm && targetFcm.fcmToken)
+                    {
+                        console.log(`[FCM Chat Push] 相手(${targetUserId})へ高優先度チャットプッシュ送信実行`);
+                        sendChatMessagePush(targetFcm.fcmToken, {
+                            fromUserId: data.fromUserId,
+                            fromName: senderName,
+                            messageId: data.messageId,
+                            text: data.text || '',
+                            iv: data.iv || '',
+                            cipher: data.cipher || '',
+                            imageBase64: data.imageBase64 || '',
+                            fileUrl: data.fileUrl || '',
+                            fileKey: data.fileKey || '',
+                            fileName: data.fileName || '',
+                            fileSize: data.fileSize || '0',
+                            senderPubKey: data.senderPubKey || '',
+                            timestamp: data.timestamp || Date.now()
+                        });
+                    }
+                    else
+                    {
+                        console.warn(`[FCM Chat Push] 相手(${targetUserId})のFCMトークンが未登録です (登録済みUID一覧: ${Array.from(fcmTokenStore.keys()).join(', ') || 'なし'})`);
+                    }
 
-                // 送信元へ受領ACK返送 (送信成功チェックマーク用)
-                if (ws.readyState === WebSocket.OPEN)
-                {
-                    ws.send(JSON.stringify({
-                        type: 'chat_sent_ack',
-                        messageId: data.messageId,
-                        timestamp: Date.now()
-                    }));
+                    // 送信元へ受領ACK返送 (送信成功チェックマーク用)
+                    if (ws.readyState === WebSocket.OPEN)
+                    {
+                        ws.send(JSON.stringify({
+                            type: 'chat_sent_ack',
+                            messageId: data.messageId,
+                            timestamp: Date.now()
+                        }));
+                    }
                 }
                 return;
             }
