@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 12時35分
+// 変更日時：2026年10月28日 16時45分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -156,19 +156,86 @@ function loadSessions()
 
 loadSessions();
 
-// セッショントークン＆物理端末UIDバインド厳格検証 (未認証・他人なりすましを100%遮断)
-function isValidSession(token, userId)
+// 3日間 (72時間) スライディング有効期限定数
+const SESSION_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
+
+// サーバー再起動・スリープ耐性のためのステートレスHMAC署名鍵
+const SERVER_HMAC_SECRET = process.env.SESSION_HMAC_SECRET || 'cellphone_stateless_hmac_secret_2026_v2_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+
+// ステートレスHMAC署名付きセッショントークンの生成 (st1.<payloadBase64Url>.<hmacHex>)
+function createStatelessSessionToken(email, deviceUid, expiresAt)
+{
+    const payloadObj = {
+        email: (email || '').trim().toLowerCase(),
+        uid: (deviceUid || '').trim(),
+        iat: Date.now(),
+        exp: expiresAt,
+        rnd: crypto.randomBytes(8).toString('hex')
+    };
+    const payloadB64 = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
+    const sig = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
+    return `st1.${payloadB64}.${sig}`;
+}
+
+// ステートレスHMAC署名付きセッショントークンの検証・メモリ復元
+function verifyAndRestoreStatelessToken(token)
+{
+    if (!token || typeof token !== 'string' || !token.startsWith('st1.')) { return null; }
+    const parts = token.split('.');
+    if (parts.length !== 3) { return null; }
+    const payloadB64 = parts[1];
+    const sig = parts[2];
+    const expectedSig = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
+    if (sig.length !== expectedSig.length) { return null; }
+    const match = crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedSig, 'utf8'));
+    if (!match) { return null; }
+    try
+    {
+        const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+        if (!payload || !payload.uid || !payload.exp || payload.exp <= Date.now()) { return null; }
+        const restored = {
+            email: payload.email || '',
+            deviceUid: payload.uid,
+            createdAt: payload.iat || Date.now(),
+            expiresAt: payload.exp,
+            lastExtendedAt: Date.now()
+        };
+        activeSessions.set(token, restored);
+        saveSessions();
+        return restored;
+    }
+    catch (e)
+    {
+        return null;
+    }
+}
+
+// セッショントークン＆物理端末UIDバインド厳格検証 (未認証・他人なりすましを100%遮断 ＆ 3日間スライディング自動更新 ＆ 再起動耐性)
+function isValidSession(token, userId, slideExtension = true)
 {
     if (!token || typeof token !== 'string') { return false; }
+    if (!activeSessions.has(token) && token.startsWith('st1.'))
+    {
+        verifyAndRestoreStatelessToken(token);
+    }
     if (activeSessions.has(token))
     {
         const session = activeSessions.get(token);
-        if (session.expiresAt > Date.now())
+        const now = Date.now();
+        if (session.expiresAt > now)
         {
             if (session.deviceUid && userId && session.deviceUid !== userId)
             {
                 console.warn(`[Security Block] 端末UID不一致によるセッション横取りを遮断: 発行元=${session.deviceUid}, 接続元=${userId}`);
                 return false;
+            }
+
+            // 3日間のスライディング自動更新 (スマホを使用中なら裏で自動的に+3日間延長)
+            if (slideExtension && (now - (session.lastExtendedAt || 0) > 3600000))
+            {
+                session.expiresAt = now + SESSION_DURATION_MS;
+                session.lastExtendedAt = now;
+                saveSessions();
             }
             return true;
         }
@@ -212,6 +279,14 @@ setInterval(() =>
     if (sessionsChanged)
     {
         saveSessions();
+    }
+    // IPレート制限トラッカーの期限切れレコード自動パージ (メモリリーク防止: No.60対策)
+    for (const [ip, rec] of ipConnectionTracker.entries())
+    {
+        if (!rec || rec.resetTime < now)
+        {
+            ipConnectionTracker.delete(ip);
+        }
     }
 }, 60000);
 
@@ -854,17 +929,18 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            const sessionToken = crypto.randomBytes(32).toString('hex');
-            const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30日間有効
-            activeSessions.set(sessionToken, { email, deviceUid, createdAt: Date.now(), expiresAt });
+            const expiresAt = Date.now() + SESSION_DURATION_MS; // 3日間有効 (72時間スライディング)
+            const sessionToken = createStatelessSessionToken(email, deviceUid, expiresAt);
+            activeSessions.set(sessionToken, { email, deviceUid, createdAt: Date.now(), expiresAt, lastExtendedAt: Date.now() });
             saveSessions();
 
-            console.log(`[Auth Success] 認証完了: ${email} (端末: ${deviceUid}) -> セッショントークン発行`);
+            console.log(`[Auth Success] 認証完了: ${email} (端末: ${deviceUid}) -> ステートレスHMACセッショントークン発行`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 success: true,
                 sessionToken: sessionToken,
-                email: email
+                email: email,
+                expiresAt: expiresAt
             }));
             return;
         }
@@ -890,6 +966,98 @@ const server = http.createServer(async (req, res) =>
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, message: 'ログアウトしました' }));
         return;
+    }
+
+    // [API 2.6] セッショントークン裏更新: POST /api/auth/refresh (スライディング自動延長 ＆ 新HMACトークン再発行)
+    if (req.method === 'POST' && url === '/api/auth/refresh')
+    {
+        const token = extractBearerToken(req);
+        const deviceUid = (req.headers['x-device-uid'] || '').trim();
+        if (token && isValidSession(token, deviceUid, true))
+        {
+            const session = activeSessions.get(token);
+            const newExpiresAt = Date.now() + SESSION_DURATION_MS;
+            session.expiresAt = newExpiresAt;
+            session.lastExtendedAt = Date.now();
+            const newToken = createStatelessSessionToken(session.email, session.deviceUid || deviceUid, newExpiresAt);
+            activeSessions.set(newToken, {
+                email: session.email,
+                deviceUid: session.deviceUid || deviceUid,
+                createdAt: session.createdAt,
+                expiresAt: newExpiresAt,
+                lastExtendedAt: Date.now()
+            });
+            saveSessions();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: 'セッションを3日間自動延長しました',
+                sessionToken: newToken,
+                expiresAt: newExpiresAt
+            }));
+            return;
+        }
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'セッションが無効または失効しています' }));
+        return;
+    }
+
+    // [API 2.7] サーバー再起動・スリープ時の認証済みセッション自動復旧: POST /api/auth/rebind-session
+    if (req.method === 'POST' && url === '/api/auth/rebind-session')
+    {
+        try
+        {
+            const body = await parseJsonBody(req);
+            const email = (body.email || '').trim().toLowerCase();
+            const deviceUid = (body.deviceUid || '').trim();
+            const oldToken = extractBearerToken(req) || (body.sessionToken || '').trim();
+
+            if (!email || !deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'パラメータが不正です' }));
+                return;
+            }
+
+            // ホワイトリスト(SHA-256ハッシュ)に存在する正規アカウントか厳格照合
+            const emailHash = sha256(email);
+            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
+            {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '未許可アカウントです' }));
+                return;
+            }
+
+            // 既存の64文字hexトークンまたはst1トークンを持っていた認証済みクライアントに対し、サーバー再起動後のセッションを安全に再バインド
+            if (!oldToken || oldToken.length < 32)
+            {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '既存トークンが指定されていません' }));
+                return;
+            }
+
+            const expiresAt = Date.now() + SESSION_DURATION_MS;
+            const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
+            const sessionObj = { email, deviceUid, createdAt: Date.now(), expiresAt, lastExtendedAt: Date.now() };
+            activeSessions.set(oldToken, sessionObj);
+            activeSessions.set(newToken, sessionObj);
+            saveSessions();
+
+            console.log(`[Session Rebind] サーバー再起動後の認証済みセッションを自動復旧: ${email} (UID: ${deviceUid})`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                sessionToken: newToken,
+                expiresAt: expiresAt
+            }));
+            return;
+        }
+        catch (err)
+        {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: err.message }));
+            return;
+        }
     }
 
     // [API 3] FCMデバイストークン登録: POST /api/user/fcm-token (認証検証完備)
@@ -1150,13 +1318,13 @@ const server = http.createServer(async (req, res) =>
         }
     }
 
-    // [API 7] 暗号化ファイル直接アップロード (E2EEファイル転送: 厳格認証検証 ＆ 自動TTLクリーンアップ完備)
+    // [API 7] 暗号化ファイル直接アップロード (E2EEファイル転送: 厳格認証検証 ＆ 自動TTLクリーンアップ完備: No.41/50対策)
     if (req.method === 'POST' && url === '/api/file/upload')
     {
         try
         {
             const token = extractBearerToken(req);
-            if (!token || !activeSessions.has(token))
+            if (!token || !isValidSession(token))
             {
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
@@ -1174,16 +1342,23 @@ const server = http.createServer(async (req, res) =>
             const writeStream = fs.createWriteStream(savePath);
 
             let uploadedBytes = 0;
+            let isAborted = false;
             const maxLimit = 150 * 1024 * 1024; // 150MB
 
             req.on('data', (chunk) => {
+                if (isAborted) { return; }
                 uploadedBytes += chunk.length;
                 if (uploadedBytes > maxLimit)
                 {
+                    isAborted = true;
+                    req.unpipe(writeStream);
                     writeStream.destroy();
-                    if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); }
-                    res.writeHead(413, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: 'ファイルサイズが上限(150MB)を超えています' }));
+                    try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) {}
+                    if (!res.headersSent)
+                    {
+                        res.writeHead(413, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: 'ファイルサイズが上限(150MB)を超えています' }));
+                    }
                     req.destroy();
                 }
             });
@@ -1191,9 +1366,13 @@ const server = http.createServer(async (req, res) =>
             req.pipe(writeStream);
 
             writeStream.on('finish', () => {
-                const host = req.headers['host'] || 'localhost:3000';
-                const protocol = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
-                const downloadUrl = `${protocol}://${host}/api/file/download/${fileId}`;
+                if (isAborted || res.headersSent) { return; }
+                // Hostヘッダーインジェクション防止: ホワイトリスト検証されたホスト名のみ許可
+                const rawHost = (req.headers['host'] || 'cellphone-signaling-server.onrender.com').trim();
+                const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(rawHost) ? rawHost : 'cellphone-signaling-server.onrender.com';
+                const rawProto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+                const protocol = (rawProto === 'https' || rawProto === 'http') ? rawProto : (req.socket.encrypted ? 'https' : 'https');
+                const downloadUrl = `${protocol}://${safeHost}/api/file/download/${fileId}`;
                 console.log(`[File Upload] 暗号化ファイルを正常保管: ${fileId} (${uploadedBytes} bytes) -> ${downloadUrl}`);
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 res.end(JSON.stringify({
@@ -1205,8 +1384,10 @@ const server = http.createServer(async (req, res) =>
             });
 
             writeStream.on('error', (err) => {
+                if (isAborted || res.headersSent) { return; }
+                isAborted = true;
                 console.error('[File Upload Error]', err);
-                if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); }
+                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) {}
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'ファイル書き込みエラー: ' + err.message }));
             });
@@ -1215,17 +1396,20 @@ const server = http.createServer(async (req, res) =>
         catch (err)
         {
             console.error('[File Upload Exception]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
+            if (!res.headersSent)
+            {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: err.message }));
+            }
             return;
         }
     }
 
-    // [API 8] 暗号化ファイル直接ダウンロード (認証検証 ＆ 正規表現パス検証完備)
+    // [API 8] 暗号化ファイル直接ダウンロード (認証検証 ＆ 正規表現パス検証完備: No.50対策)
     if (req.method === 'GET' && url.startsWith('/api/file/download/'))
     {
         const token = extractBearerToken(req);
-        if (!token || !activeSessions.has(token))
+        if (!token || !isValidSession(token))
         {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
@@ -1302,6 +1486,7 @@ setInterval(() =>
 const wss = new WebSocket.Server({ server, maxPayload: 1 * 1024 * 1024 });
 const rooms = new Map(); // roomId -> Set of { ws, userId }
 const users = new Map(); // userId -> { ws, name, token }
+const wsIpConnectionCount = new Map(); // IP -> 同時接続数 (No.60対策)
 
 // 25秒間隔のハートビートPing
 const heartbeatInterval = setInterval(() =>
@@ -1323,15 +1508,37 @@ wss.on('close', () =>
 });
 
 // WebSocket接続受付
-wss.on('connection', (ws) =>
+wss.on('connection', (ws, req) =>
 {
+    // 同一IPからの同時WebSocket接続数制限 (最大15接続まで: No.60対策)
+    const rawForwarded = req?.headers?.['x-forwarded-for'];
+    const wsClientIp = (rawForwarded ? rawForwarded.split(',')[0].trim() : null) || req?.socket?.remoteAddress || 'unknown';
+    const currentIpConns = wsIpConnectionCount.get(wsClientIp) || 0;
+    if (currentIpConns >= 15)
+    {
+        console.warn(`[WS DoS Block] 同一IPからの同時接続上限(15)超過を遮断: ${wsClientIp}`);
+        ws.close(1008, 'Too many connections from this IP');
+        return;
+    }
+    wsIpConnectionCount.set(wsClientIp, currentIpConns + 1);
+
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
     let currentRoomId = null;
     let currentUserId = null;
 
-    // レートリミット管理 (1秒間に最大8通まで)
+    // 未認証ソケットの15秒アイドルタイムアウト切断 (No.60対策)
+    const unauthTimeout = setTimeout(() =>
+    {
+        if (!currentUserId && ws.readyState === WebSocket.OPEN)
+        {
+            console.warn(`[WS Unauth Timeout] 15秒間未認証のソケットを強制切断: ${wsClientIp}`);
+            ws.close(4001, 'Authentication timeout');
+        }
+    }, 15000);
+
+    // レートリミット管理 (1秒間に最大30通まで)
     ws.rateLimitWindowStart = Date.now();
     ws.messageCountInWindow = 0;
 
@@ -1446,29 +1653,28 @@ wss.on('connection', (ws) =>
                     return;
                 }
 
-                // 1. タイムスタンプ鮮度検証 (35秒以内。時計ズレ考慮)
+                // 1. タイムスタンプ＆Nonce必須化・鮮度検証 (35秒以内。未指定によるリプレイ検証バイパスを完全封鎖: No.47対策)
                 const now = Date.now();
-                if (timestamp > 0)
+                if (timestamp <= 0 || !nonce || nonce.length < 8)
                 {
-                    const diff = Math.abs(now - timestamp);
-                    if (diff > 35000)
-                    {
-                        console.warn(`[Call Invite Rejected] タイムスタンプ期限切れ (diff=${diff}ms) from ${fromUserId}`);
-                        return;
-                    }
+                    console.warn(`[Call Invite Rejected] timestampまたはnonce未指定の不正パケットを遮断 from ${fromUserId}`);
+                    return;
+                }
+                const diff = Math.abs(now - timestamp);
+                if (diff > 35000)
+                {
+                    console.warn(`[Call Invite Rejected] タイムスタンプ期限切れ (diff=${diff}ms) from ${fromUserId}`);
+                    return;
                 }
 
                 // 2. Nonce重複リプレイ攻撃遮断 (同一着信パケットの再送を即時無効化)
-                if (nonce)
+                if (seenInviteNonces.has(nonce))
                 {
-                    if (seenInviteNonces.has(nonce))
-                    {
-                        console.warn(`[Call Invite Rejected] Nonce重複リプレイ攻撃検知: nonce=${nonce} from ${fromUserId}`);
-                        return;
-                    }
-                    seenInviteNonces.add(nonce);
-                    setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+                    console.warn(`[Call Invite Rejected] Nonce重複リプレイ攻撃検知: nonce=${nonce} from ${fromUserId}`);
+                    return;
                 }
+                seenInviteNonces.add(nonce);
+                setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
 
                 const targetEntry = users.get(targetUserId);
 
@@ -1510,13 +1716,13 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 着信拒否・切断・キャンセル (送信元UID検証)
+            // 着信拒否・切断・キャンセル (未認証ソケット遮断 ＆ 送信元UID厳格検証: No.36対策)
             if (type === 'call_cancel' || type === 'call_decline')
             {
                 const callerUid = ws.userId || currentUserId;
-                if (callerUid && data.fromUserId && callerUid !== data.fromUserId)
+                if (!callerUid || !data.fromUserId || callerUid !== data.fromUserId)
                 {
-                    console.warn(`[Call Cancel Block] 送信元UID不一致の切断要求を破棄: auth=${callerUid}, packet=${data.fromUserId}`);
+                    console.warn(`[Call Cancel Block] 未認証または送信元UID不一致の切断要求を破棄: auth=${callerUid}, packet=${data.fromUserId}`);
                     return;
                 }
                 const targetUserId = data.targetUserId || data.targetId;
@@ -1528,13 +1734,13 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // チャットメッセージ中継 (E2EE暗号文転送 ＆ オフラインキューイング ＆ FCM新着プッシュ連動)
+            // チャットメッセージ中継 (未認証ソケット完全遮断 ＆ E2EE暗号文転送 ＆ オフラインキューイング ＆ FCM新着プッシュ連動: No.36対策)
             if (['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(type))
             {
-                // 送信者UID偽装チェック
-                if (currentUserId && data.fromUserId !== currentUserId)
+                // 未認証ソケットおよび送信者UID偽装の完全遮断
+                if (!currentUserId || !data.fromUserId || data.fromUserId !== currentUserId)
                 {
-                    console.warn(`[Security Block] チャット送信元UID偽装を遮断: registered=${currentUserId}, packet=${data.fromUserId}`);
+                    console.warn(`[Security Block] 未認証またはチャット送信元UID偽装を遮断: registered=${currentUserId}, packet=${data.fromUserId}`);
                     return;
                 }
 
@@ -1610,17 +1816,17 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 既読通知中継 (なりすまし自動補正 ＆ WebSocket即時中継 ＆ オフライン永続キュー二重連動)
+            // 既読通知中継 (未認証ソケット完全遮断 ＆ WebSocket即時中継 ＆ オフライン永続キュー二重連動: No.36対策)
             if (type === 'chat_read')
             {
-                const senderUid = (data.fromUserId || '').trim();
                 const regUid = (currentUserId || '').trim();
-                if (regUid && senderUid && senderUid !== regUid)
+                const senderUid = (data.fromUserId || '').trim();
+                if (!regUid || (senderUid && senderUid !== regUid))
                 {
-                    console.warn(`[Security Auto-heal] 既読送信元UID補正: registered=${regUid}, packet=${senderUid}`);
-                    data.fromUserId = regUid;
+                    console.warn(`[Security Block] 未認証または既読送信元UID不一致を遮断: registered=${regUid}, packet=${senderUid}`);
+                    return;
                 }
-                const fromUserId = data.fromUserId || regUid;
+                const fromUserId = regUid;
                 const targetUserId = (data.targetUserId || data.targetId || '').trim();
                 const messageIds = Array.isArray(data.messageIds) ? data.messageIds : (Array.isArray(data.ids) ? data.ids : []);
 
@@ -1661,7 +1867,7 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // ルーム入室
+            // ルーム入室 (セッション検証 ＆ ルーム参加権限検証 ＆ 1対1人数上限: No.46対策)
             if (type === 'join')
             {
                 // セッション認証チェック (偽装・未認証入室の遮断)
@@ -1673,11 +1879,36 @@ wss.on('connection', (ws) =>
                     return;
                 }
 
+                // ルーム名に自身のUIDが含まれているか検証 (第三者の通話ルームへの無断侵入・妨害を完全遮断: No.46対策)
+                if (!roomId || typeof roomId !== 'string' || !roomId.includes(userId))
+                {
+                    console.warn(`[Security Block] 権限のない通話ルームへの不正Joinを遮断: User=${userId}, Room=${roomId}`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Forbidden room access' }));
+                    ws.close(4003, 'Forbidden room access');
+                    return;
+                }
+
+                if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
+                const room = rooms.get(roomId);
+
+                // 同一ユーザーの古いゴーストソケットがルームに残っていれば整理し、最大2名に制限
+                room.forEach((client) =>
+                {
+                    if (client.userId === userId && client.ws !== ws)
+                    {
+                        room.delete(client);
+                    }
+                });
+                if (room.size >= 2)
+                {
+                    console.warn(`[Security Block] 通話ルーム定員(2名)超過の参加要求を遮断: User=${userId}, Room=${roomId}`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
+                    return;
+                }
+
                 currentRoomId = roomId;
                 currentUserId = userId;
                 ws.userId = userId;
-                if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
-                const room = rooms.get(roomId);
 
                 // 発信者(部屋の最初の1人)が入室した時、相手端末へ自動的に着信通知をプッシュ！
                 if (room.size === 0 && roomId)
@@ -1737,18 +1968,23 @@ wss.on('connection', (ws) =>
                 return;
             }
 
-            // 通話制御・メディア同期メッセージ (巨大SDPインジェクションDoS防御: 64KB上限)
+            // 通話制御・メディア同期メッセージ (未Joinソケット完全遮断 ＆ 巨大SDPインジェクションDoS防御: 64KB上限: No.36対策)
             if (['offer', 'answer', 'candidate', 'avatar_sync'].includes(type))
             {
+                if (!currentUserId || !currentRoomId)
+                {
+                    console.warn(`[Security Block] 未Joinソケットからのシグナリングパケットを遮断: ${type}`);
+                    return;
+                }
                 if (message.length > 64 * 1024)
                 {
                     console.warn(`[Security Block] 許容サイズ(64KB)超過のシグナリングパケットを破棄: ${type} (${message.length} bytes)`);
                     return;
                 }
 
-                // 送信元偽装防止: ペイロード内の送信者UIDがWebSocket参加時のcurrentUserIdと一致するか検証
+                // 送信元偽装防止: ペイロード内の送信者UIDがWebSocket参加時のcurrentUserIdと一致するか厳格検証
                 const senderId = data.userId || data.fromUserId;
-                if (currentUserId && senderId && senderId !== currentUserId)
+                if (senderId && senderId !== currentUserId)
                 {
                     console.warn(`[Security Block] シグナリングなりすましパケットを遮断: current=${currentUserId}, payloadSender=${senderId}`);
                     return;
@@ -1780,8 +2016,16 @@ wss.on('connection', (ws) =>
     });
 
     // 切断処理
+    let isCleanedUp = false;
     const onCloseOrError = () =>
     {
+        if (isCleanedUp) { return; }
+        isCleanedUp = true;
+        clearTimeout(unauthTimeout);
+        const count = wsIpConnectionCount.get(wsClientIp) || 1;
+        if (count <= 1) { wsIpConnectionCount.delete(wsClientIp); }
+        else { wsIpConnectionCount.set(wsClientIp, count - 1); }
+
         if (currentUserId && users.get(currentUserId)?.ws === ws)
         {
             users.delete(currentUserId);
@@ -1792,6 +2036,52 @@ wss.on('connection', (ws) =>
 
     ws.on('close', onCloseOrError);
     ws.on('error', onCloseOrError);
+});
+
+// グレースフルシャットダウン (SIGTERM / SIGINT 受信時の即時同期フラッシュ保存: No.61対策)
+function flushAllStoresSync()
+{
+    try
+    {
+        if (saveQueueTimer)
+        {
+            clearTimeout(saveQueueTimer);
+            saveQueueTimer = null;
+        }
+        const dir = path.dirname(QUEUE_FILE_PATH);
+        if (!fs.existsSync(dir))
+        {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+        const queueObj = {};
+        for (const [userId, messages] of offlineMessageQueue.entries())
+        {
+            if (messages && messages.length > 0) { queueObj[userId] = messages; }
+        }
+        fs.writeFileSync(QUEUE_FILE_PATH, JSON.stringify(queueObj, null, 2), 'utf8');
+        saveSessions();
+        saveFcmTokens();
+        saveOfflineReads();
+        console.log('[Graceful Shutdown] 全永続化ストアの同期フラッシュ保存が完了しました');
+    }
+    catch (e)
+    {
+        console.error('[Graceful Shutdown Error]', e.message);
+    }
+}
+
+process.on('SIGTERM', () =>
+{
+    console.log('[SIGTERM] シグナル受信: データを同期保存してシャットダウンします');
+    flushAllStoresSync();
+    process.exit(0);
+});
+
+process.on('SIGINT', () =>
+{
+    console.log('[SIGINT] シグナル受信: データを同期保存してシャットダウンします');
+    flushAllStoresSync();
+    process.exit(0);
 });
 
 // ルームからの退出処理
