@@ -1,5 +1,9 @@
-// 変更日時：2026年10月28日 19時55分
-// GitHub (ketoshisub2016-web/cellphone-signaling-server/server.js) 単一ファイル貼り付け用
+// 変更日時：2026年10月28日 20時02分
+// ============================================================================
+// GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
+// 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
+// ※ server/server.js または server/modules/*.js 変更時に自動上書き生成されます
+// ============================================================================
 const __internalModules = {};
 function __requireModule(name) { return __internalModules[name]; }
 
@@ -2289,8 +2293,10 @@ return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Main: server.js] ====================
-// 変更日時：2026年10月28日 19時34分
+// 変更日時：2026年10月28日 20時03分
 // WebRTC Signaling Server エントリポイント (モジュール分割リファクタリング版)
+// 【AI厳守ルール】本ファイルまたは ./modules/*.js を変更した際は、必ず `node scripts/bundle_server_for_github.js` を実行し、
+// `server/server_single_for_github.js` に最新の変更内容を完全上書き反映すること（詳細は「サーバー更新指示書.txt」参照）。
 // 構成モジュール:
 //  - ./modules/stateStore.js          : セッション・オフラインキュー・FCMトークン・永続化ストア
 //  - ./modules/pushAndMail.js         : Firebase Admin FCMプッシュ送信・GAS/SMTPメール送信
