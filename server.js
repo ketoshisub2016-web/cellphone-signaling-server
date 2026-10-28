@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 20時02分
+// 変更日時：2026年10月28日 21時10分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年10月28日 19時33分
+// 変更日時：2026年10月28日 21時10分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -44,7 +44,9 @@ const QUEUE_FILE_PATH = path.join(DATA_DIR, 'offline_queue.json');
 const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
 const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
 
-// ハードコード秘密鍵を排除し、環境変数またはセキュアな永続ランダム鍵ファイルからロード (No.02対策)
+const LEGACY_HMAC_SECRET = 'cellphone_hmac_secret_v1_2026_persistent_key';
+
+// Render無料枠のコンテナ再起動・スピンダウンでファイルシステムが消去されても既存端末のst1.トークンが失効しないよう決定論的導出鍵をサポート
 function loadOrCreateServerHmacSecret()
 {
     const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
@@ -52,26 +54,9 @@ function loadOrCreateServerHmacSecret()
     {
         return envSecret;
     }
-    try
-    {
-        if (!fs.existsSync(DATA_DIR))
-        {
-            fs.mkdirSync(DATA_DIR, { recursive: true });
-        }
-        if (fs.existsSync(SECRET_KEY_FILE))
-        {
-            const saved = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
-            if (saved.length >= 64) { return saved; }
-        }
-        const generated = crypto.randomBytes(64).toString('hex');
-        fs.writeFileSync(SECRET_KEY_FILE, generated, { encoding: 'utf8', mode: 0o600 });
-        return generated;
-    }
-    catch (e)
-    {
-        console.error('[Security Secret] 鍵ファイル生成例外:', e.message);
-        return crypto.randomBytes(64).toString('hex');
-    }
+    return crypto.createHmac('sha256', LEGACY_HMAC_SECRET)
+        .update(Array.from(ALLOWED_EMAIL_HASHES).sort().join(':'))
+        .digest('hex');
 }
 
 const SERVER_HMAC_SECRET = loadOrCreateServerHmacSecret();
@@ -295,10 +280,13 @@ function verifyAndRestoreStatelessToken(token)
     if (parts.length !== 3) { return null; }
     const payloadB64 = parts[1];
     const sig = parts[2];
-    const expectedSig = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
-    if (sig.length !== expectedSig.length) { return null; }
-    const match = crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedSig, 'utf8'));
-    if (!match) { return null; }
+    const expectedPrimary = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
+    const expectedLegacy = crypto.createHmac('sha256', LEGACY_HMAC_SECRET).update(payloadB64).digest('hex');
+    const matchPrimary = sig.length === expectedPrimary.length
+        && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8'));
+    const matchLegacy = !matchPrimary && sig.length === expectedLegacy.length
+        && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedLegacy, 'utf8'));
+    if (!matchPrimary && !matchLegacy) { return null; }
     try
     {
         const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
@@ -848,7 +836,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年10月28日 19時33分
+// 変更日時：2026年10月28日 21時10分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -865,6 +853,7 @@ const {
     sha256,
     saveSessions,
     revokeSessionToken,
+    isTokenRevoked,
     createStatelessSessionToken,
     isValidSession,
     extractBearerToken,
@@ -1179,17 +1168,43 @@ async function handleAuthRoutes(req, res, url)
                 return true;
             }
 
-            if (!oldToken || !isValidSession(oldToken, deviceUid, false))
+            if (!oldToken || isTokenRevoked(oldToken))
             {
-                console.warn(`[Security Block] 無効または未認証トークンによるセッション再バインド要求を遮断: email=${email}, uid=${deviceUid}`);
+                console.warn(`[Security Block] 未指定または失効済みトークンによるセッション再バインド要求を遮断: email=${email}, uid=${deviceUid}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '既存セッションが無効または失効しています。再ログインしてください' }));
                 return true;
             }
 
-            const existingSession = activeSessions.get(oldToken);
-            const existingEmailHash = existingSession?.emailHash || sha256(existingSession?.email || '');
-            if (!existingSession || (existingEmailHash && existingEmailHash !== emailHash) || existingSession.deviceUid !== deviceUid)
+            let ownerVerified = false;
+            if (isValidSession(oldToken, deviceUid, false))
+            {
+                const existingSession = activeSessions.get(oldToken);
+                const existingEmailHash = existingSession?.emailHash || sha256(existingSession?.email || '');
+                if (existingSession && (!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
+                {
+                    ownerVerified = true;
+                }
+            }
+            else if (oldToken.startsWith('st1.'))
+            {
+                try
+                {
+                    const parts = oldToken.split('.');
+                    if (parts.length === 3)
+                    {
+                        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+                        const payloadEmailHash = payload?.emailHash || sha256(payload?.email || '');
+                        if (payload && payload.uid === deviceUid && payloadEmailHash === emailHash && !isTokenRevoked(oldToken, payload.jti || ''))
+                        {
+                            ownerVerified = true;
+                        }
+                    }
+                }
+                catch (e) {}
+            }
+
+            if (!ownerVerified)
             {
                 console.warn(`[Security Block] セッション所有者と異なるemail/UIDへの乗り換えを遮断: uid=${deviceUid}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1197,13 +1212,14 @@ async function handleAuthRoutes(req, res, url)
                 return true;
             }
 
+            const existingSession = activeSessions.get(oldToken);
             const expiresAt = Date.now() + SESSION_DURATION_MS;
             const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
             const sessionObj = {
                 email,
                 emailHash,
                 deviceUid,
-                createdAt: existingSession.createdAt || Date.now(),
+                createdAt: existingSession?.createdAt || Date.now(),
                 expiresAt,
                 lastExtendedAt: Date.now()
             };
