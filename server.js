@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 11時44分
+// 変更日時：2026年10月28日 12時10分
 // WebRTC Signaling Server for CellPhone App (Glitch / Render / Local Node.js 対応)
 // 二段階認証(メールOTP)、E2EEチャット中継、FCMプッシュ着信、偽装防止検証、WebSocket認証＆レートリミット統合版
 
@@ -88,6 +88,29 @@ const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 
 // 着信リプレイ攻撃防止 Nonce キャッシュ (重複着信・DoS遮断)
 const seenInviteNonces = new Set();
+
+// メールアドレス別 OTP 送信クールダウントラッカー (email -> lastSentTimestamp / メールボムDoS遮断)
+const emailOtpCooldownTracker = new Map();
+
+// 期限切れセッショントークンの定期自動パージ (1時間ごと)
+setInterval(() =>
+{
+    const now = Date.now();
+    let purged = 0;
+    for (const [token, sess] of activeSessions.entries())
+    {
+        if (!sess || sess.expiresAt <= now)
+        {
+            activeSessions.delete(token);
+            purged++;
+        }
+    }
+    if (purged > 0)
+    {
+        console.log(`[Session Cleanup] 期限切れセッション ${purged} 件を自動パージしました`);
+        saveSessions();
+    }
+}, 3600000);
 
 function saveSessions()
 {
@@ -651,16 +674,17 @@ const server = http.createServer(async (req, res) =>
                 return;
             }
 
-            // [急所2防御] メール連打・スパム爆撃防止: 60秒クールダウンチェック
+            // [急所2防御] メール連打・スパム爆撃防止: 60秒クールダウンチェック (独立トラッカーでメールボムDoS完全遮断)
             const now = Date.now();
-            const existingOtp = otpStore.get(email);
-            if (existingOtp && existingOtp.lastSentAt && (now - existingOtp.lastSentAt < 60000))
+            const lastSent = emailOtpCooldownTracker.get(email) || 0;
+            if (now - lastSent < 60000)
             {
-                const remainSec = Math.ceil((60000 - (now - existingOtp.lastSentAt)) / 1000);
+                const remainSec = Math.ceil((60000 - (now - lastSent)) / 1000);
                 res.writeHead(429, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: `認証コードは送信済みです。再送信まであと ${remainSec} 秒お待ちください` }));
                 return;
             }
+            emailOtpCooldownTracker.set(email, now);
 
             // 6桁ランダムコード生成 (100000〜999999)
             const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -821,12 +845,19 @@ const server = http.createServer(async (req, res) =>
 
             // [シナリオC防御] セッショントークン生成 ＆ 端末固有UIDと物理バインド
             const deviceUid = (body.deviceUid || '').trim();
+            if (!deviceUid)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が指定されていません' }));
+                return;
+            }
+
             const sessionToken = crypto.randomBytes(32).toString('hex');
             const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30日間有効
             activeSessions.set(sessionToken, { email, deviceUid, createdAt: Date.now(), expiresAt });
             saveSessions();
 
-            console.log(`[Auth Success] 認証完了: ${email} (端末: ${deviceUid || 'unknown'}) -> セッショントークン発行`);
+            console.log(`[Auth Success] 認証完了: ${email} (端末: ${deviceUid}) -> セッショントークン発行`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 success: true,
@@ -839,9 +870,24 @@ const server = http.createServer(async (req, res) =>
         {
             console.error('[OTP Verify Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '認証検証エラー: ' + err.message }));
+            res.end(JSON.stringify({ success: false, error: '内部認証処理エラー: ' + err.message }));
             return;
         }
+    }
+
+    // [API 2.5] ログアウト: POST /api/auth/logout (セッショントークン即時能動的失効)
+    if (req.method === 'POST' && url === '/api/auth/logout')
+    {
+        const token = extractBearerToken(req);
+        if (token && activeSessions.has(token))
+        {
+            activeSessions.delete(token);
+            saveSessions();
+            console.log(`[Auth Logout] セッショントークンを安全に破棄しました`);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, message: 'ログアウトしました' }));
+        return;
     }
 
     // [API 3] FCMデバイストークン登録: POST /api/user/fcm-token (認証検証完備)
@@ -1102,16 +1148,16 @@ const server = http.createServer(async (req, res) =>
         }
     }
 
-    // [API 7] 暗号化ファイル直接アップロード (E2EEファイル転送: 認証検証 ＆ 自動TTLクリーンアップ完備)
+    // [API 7] 暗号化ファイル直接アップロード (E2EEファイル転送: 厳格認証検証 ＆ 自動TTLクリーンアップ完備)
     if (req.method === 'POST' && url === '/api/file/upload')
     {
         try
         {
             const token = extractBearerToken(req);
-            if (token && !activeSessions.has(token))
+            if (!token || !activeSessions.has(token))
             {
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return;
             }
 
@@ -1173,11 +1219,27 @@ const server = http.createServer(async (req, res) =>
         }
     }
 
-    // [API 8] 暗号化ファイル直接ダウンロード (生のバイナリを高速・確実に返却)
+    // [API 8] 暗号化ファイル直接ダウンロード (認証検証 ＆ 正規表現パス検証完備)
     if (req.method === 'GET' && url.startsWith('/api/file/download/'))
     {
+        const token = extractBearerToken(req);
+        if (!token || !activeSessions.has(token))
+        {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+            return;
+        }
+
+        const urlPath = url.split('?')[0];
+        const fileId = path.basename(urlPath);
+        if (!/^enc_[a-f0-9]{32}$/.test(fileId))
+        {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '無効なファイル識別子です' }));
+            return;
+        }
+
         const UPLOAD_DIR = path.join(__dirname, 'uploads');
-        const fileId = path.basename(url);
         const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
         if (!fs.existsSync(filePath))
         {
@@ -1588,6 +1650,15 @@ wss.on('connection', (ws) =>
             // ルーム入室
             if (type === 'join')
             {
+                // セッション認証チェック (偽装・未認証入室の遮断)
+                if (!data.token || !isValidSession(data.token, userId))
+                {
+                    console.warn(`[Security Block] 不正または無効なセッションのWebSocket参加要求を遮断: User=${userId}, Room=${roomId}`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized session' }));
+                    ws.close(4001, 'Unauthorized session');
+                    return;
+                }
+
                 currentRoomId = roomId;
                 currentUserId = userId;
                 if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
@@ -1657,6 +1728,14 @@ wss.on('connection', (ws) =>
                 if (message.length > 64 * 1024)
                 {
                     console.warn(`[Security Block] 許容サイズ(64KB)超過のシグナリングパケットを破棄: ${type} (${message.length} bytes)`);
+                    return;
+                }
+
+                // 送信元偽装防止: ペイロード内の送信者UIDがWebSocket参加時のcurrentUserIdと一致するか検証
+                const senderId = data.userId || data.fromUserId;
+                if (currentUserId && senderId && senderId !== currentUserId)
+                {
+                    console.warn(`[Security Block] シグナリングなりすましパケットを遮断: current=${currentUserId}, payloadSender=${senderId}`);
                     return;
                 }
 
