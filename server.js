@@ -1,4 +1,4 @@
-// 変更日時：2026年10月31日 12時53分
+// 変更日時：2026年10月31日 13時33分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年10月31日 12時08分
+// 変更日時：2026年10月31日 13時34分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -45,12 +45,17 @@ const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
 const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
 const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
 
-// サーバーHMAC暗号シークレット取得（環境変数最優先、次に永続化ファイル、未作成時は強力な32バイト乱数自動生成: VULN-02是正）
+// クラウド環境（Render等）の揮発性ディスク・スピンダウン耐性用 安定フォールバックマスターシード
+const CLOUD_STABLE_HMAC_SEED = 'CellPhoneApp_SignalingServer_StableHmacSecret_Seed_2026_SecureStatelessSessionToken_V2';
+const CLOUD_FALLBACK_KEY = crypto.createHash('sha256').update(CLOUD_STABLE_HMAC_SEED).digest('hex');
+
+// サーバーHMAC暗号シークレット取得（環境変数最優先、次に永続化ファイル、未作成時はクラウド安定キー採用: Render再起動セッション維持）
 function loadOrCreateServerHmacSecret()
 {
     const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
     if (envSecret.length >= 32)
     {
+        console.log('[Security] 環境変数 SESSION_HMAC_SECRET からHMACキーを設定しました');
         return envSecret;
     }
 
@@ -65,20 +70,20 @@ function loadOrCreateServerHmacSecret()
             const savedKey = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
             if (savedKey.length >= 32)
             {
+                console.log('[Security] 保存済みキーファイルからHMACキーを復元しました');
                 return savedKey;
             }
         }
 
-        // 固定文字列導出を廃止し、強力な暗号乱数キーを生成して保護保存
-        const newSecret = crypto.randomBytes(32).toString('hex');
-        fs.writeFileSync(SECRET_KEY_FILE, newSecret, { mode: 0o600 });
-        console.log('[Security] 新規サーバーHMACシークレットキーを生成・保存しました');
-        return newSecret;
+        // Render等の揮発性コンテナでもスピンダウン/再起動でセッションが壊れないよう、安定シークレットキーを保存・採用
+        fs.writeFileSync(SECRET_KEY_FILE, CLOUD_FALLBACK_KEY, { mode: 0o600 });
+        console.log('[Security] クラウド安定シークレットキーでHMAC署名キーを初期化・保存しました (Render再起動セッション維持)');
+        return CLOUD_FALLBACK_KEY;
     }
     catch (err)
     {
-        console.warn('[Security Warning] シークレットファイル保存失敗。一時メモリ乱数を使用:', err.message);
-        return crypto.randomBytes(32).toString('hex');
+        console.warn('[Security Warning] シークレットファイル保存失敗。クラウド安定フォールバックキーを使用:', err.message);
+        return CLOUD_FALLBACK_KEY;
     }
 }
 
