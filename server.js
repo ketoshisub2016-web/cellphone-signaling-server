@@ -1,4 +1,4 @@
-// 変更日時：2026年10月28日 21時10分
+// 変更日時：2026年10月31日 12時09分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年10月28日 21時10分
+// 変更日時：2026年10月31日 12時08分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -43,10 +43,9 @@ const SESSIONS_FILE = path.join(SERVER_DIR, 'sessions.json');
 const QUEUE_FILE_PATH = path.join(DATA_DIR, 'offline_queue.json');
 const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
 const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
+const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
 
-const LEGACY_HMAC_SECRET = 'cellphone_hmac_secret_v1_2026_persistent_key';
-
-// Render無料枠のコンテナ再起動・スピンダウンでファイルシステムが消去されても既存端末のst1.トークンが失効しないよう決定論的導出鍵をサポート
+// サーバーHMAC暗号シークレット取得（環境変数最優先、次に永続化ファイル、未作成時は強力な32バイト乱数自動生成: VULN-02是正）
 function loadOrCreateServerHmacSecret()
 {
     const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
@@ -54,9 +53,33 @@ function loadOrCreateServerHmacSecret()
     {
         return envSecret;
     }
-    return crypto.createHmac('sha256', LEGACY_HMAC_SECRET)
-        .update(Array.from(ALLOWED_EMAIL_HASHES).sort().join(':'))
-        .digest('hex');
+
+    try
+    {
+        if (!fs.existsSync(DATA_DIR))
+        {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+        }
+        if (fs.existsSync(SECRET_KEY_FILE))
+        {
+            const savedKey = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
+            if (savedKey.length >= 32)
+            {
+                return savedKey;
+            }
+        }
+
+        // 固定文字列導出を廃止し、強力な暗号乱数キーを生成して保護保存
+        const newSecret = crypto.randomBytes(32).toString('hex');
+        fs.writeFileSync(SECRET_KEY_FILE, newSecret, { mode: 0o600 });
+        console.log('[Security] 新規サーバーHMACシークレットキーを生成・保存しました');
+        return newSecret;
+    }
+    catch (err)
+    {
+        console.warn('[Security Warning] シークレットファイル保存失敗。一時メモリ乱数を使用:', err.message);
+        return crypto.randomBytes(32).toString('hex');
+    }
 }
 
 const SERVER_HMAC_SECRET = loadOrCreateServerHmacSecret();
@@ -280,13 +303,12 @@ function verifyAndRestoreStatelessToken(token)
     if (parts.length !== 3) { return null; }
     const payloadB64 = parts[1];
     const sig = parts[2];
+    // VULN-33是正: 未定義LEGACY_HMAC_SECRETを廃止し、Primary署名を厳格に検証
     const expectedPrimary = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
-    const expectedLegacy = crypto.createHmac('sha256', LEGACY_HMAC_SECRET).update(payloadB64).digest('hex');
-    const matchPrimary = sig.length === expectedPrimary.length
-        && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8'));
-    const matchLegacy = !matchPrimary && sig.length === expectedLegacy.length
-        && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedLegacy, 'utf8'));
-    if (!matchPrimary && !matchLegacy) { return null; }
+    if (sig.length !== expectedPrimary.length || !crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8')))
+    {
+        return null;
+    }
     try
     {
         const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
@@ -397,6 +419,39 @@ function saveOfflineQueue()
     }, 200);
 }
 
+
+// VULN-34是正: 添付ファイルACLの暗号化永続化保存・復元
+function saveAttachmentAcls()
+{
+    const obj = {};
+    for (const [k, v] of attachmentAclStore.entries())
+    {
+        obj[k] = v;
+    }
+    writeEncryptedJsonFile(ATTACHMENT_ACLS_FILE, obj);
+}
+
+function loadAttachmentAcls()
+{
+    try
+    {
+        const obj = readEncryptedJsonFile(ATTACHMENT_ACLS_FILE);
+        if (!obj) { return; }
+        for (const [k, v] of Object.entries(obj))
+        {
+            if (v && v.uploaderUid)
+            {
+                attachmentAclStore.set(k, v);
+            }
+        }
+        console.log(`[Attachment ACL Store] ${attachmentAclStore.size} 件のファイル認可情報を復元完了`);
+    }
+    catch (e)
+    {
+        console.error('[Attachment ACL Store] 復元エラー:', e.message);
+    }
+}
+
 function saveFcmTokens()
 {
     const obj = {};
@@ -493,6 +548,7 @@ function flushAllStoresSync()
         saveRevokedTokens();
         saveFcmTokens();
         saveOfflineReads();
+        saveAttachmentAcls();
         console.log('[Graceful Shutdown] 全永続化ストアの暗号化同期保存が完了しました');
     }
     catch (e)
@@ -507,6 +563,7 @@ loadSessions();
 loadOfflineQueue();
 loadFcmTokens();
 loadOfflineReads();
+loadAttachmentAcls();
 
 setInterval(() =>
 {
@@ -579,6 +636,7 @@ module.exports = {
     saveOfflineQueue,
     saveFcmTokens,
     saveOfflineReads,
+    saveAttachmentAcls,
     parseJsonBody,
     flushAllStoresSync
 };
@@ -588,7 +646,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/pushAndMail.js] ====================
 __internalModules['./modules/pushAndMail'] = (function(module, exports) {
-// 変更日時：2026年10月28日 19時34分
+// 変更日時：2026年10月31日 12時14分
 // [サーバーモジュール] Firebase Admin FCMプッシュ送信 ＆ OTP認証メール送信 (GAS / SMTP)
 
 const https = require('https');
@@ -602,10 +660,10 @@ let firebaseApp = null;
 try
 {
     admin = require('firebase-admin');
-    const localSdkPath = path.join(SERVER_DIR, 'firebase-adminsdk.json');
+    // VULN-38是正: ローカルファイル依存を完全撤廃し、環境変数 FIREBASE_SERVICE_ACCOUNT に一本化
     const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
         ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-        : (fs.existsSync(localSdkPath) ? require(localSdkPath) : null);
+        : null;
 
     if (serviceAccount && admin)
     {
@@ -799,12 +857,16 @@ async function sendChatMessagePush(targetFcmToken, chatData)
                 text: String(chatData.text || ''),
                 iv: String(chatData.iv || ''),
                 cipher: String(chatData.cipher || ''),
-                imageBase64: String(chatData.imageBase64 || ''),
+                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
+                hasImage: String(chatData.hasImage === 'true' || !!chatData.imageBase64 ? 'true' : 'false'),
                 fileUrl: String(chatData.fileUrl || ''),
-                fileKey: String(chatData.fileKey || ''),
+                // VULN-21是正: 添付ファイル復号鍵(fileKey)を平文プッシュ伝送から完全排除（E2EEペイロード内のみで安全に伝送）
+                fileKey: '',
                 fileName: String(chatData.fileName || ''),
                 fileSize: String(chatData.fileSize || '0'),
                 senderPubKey: String(chatData.senderPubKey || ''),
+                // VULN-24是正: 電子署名(senderPubSig)を正しく伝送し、FCMプッシュ経由での鍵検証を可能にする
+                senderPubSig: String(chatData.senderPubSig || ''),
                 timestamp: String(chatData.timestamp || Date.now())
             },
             android: {
@@ -836,7 +898,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年10月28日 21時10分
+// 変更日時：2026年10月31日 12時16分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -855,6 +917,7 @@ const {
     revokeSessionToken,
     isTokenRevoked,
     createStatelessSessionToken,
+    verifyAndRestoreStatelessToken,
     isValidSession,
     extractBearerToken,
     saveFcmTokens,
@@ -1112,18 +1175,32 @@ async function handleAuthRoutes(req, res, url)
         const deviceUid = (req.headers['x-device-uid'] || '').trim();
         if (token && isValidSession(token, deviceUid, true))
         {
-            const session = activeSessions.get(token);
+            let session = activeSessions.get(token);
+            if (!session && token.startsWith('st1.'))
+            {
+                session = verifyAndRestoreStatelessToken(token);
+            }
+            if (!session)
+            {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'セッション情報の復元に失敗しました' }));
+                return true;
+            }
+
             const newExpiresAt = Date.now() + SESSION_DURATION_MS;
-            session.expiresAt = newExpiresAt;
-            session.lastExtendedAt = Date.now();
             const effUid = session.deviceUid || deviceUid;
             const newToken = createStatelessSessionToken(session.email, effUid, newExpiresAt);
+
+            // VULN-35是正: 旧トークンを失効リストへ即時登録しゾンビセッション化を完全防止
+            revokeSessionToken(token);
+            activeSessions.delete(token);
+
             enforceMapSizeCap(activeSessions, 5000);
             activeSessions.set(newToken, {
                 email: session.email,
                 emailHash: session.emailHash || sha256(session.email || ''),
                 deviceUid: effUid,
-                createdAt: session.createdAt,
+                createdAt: session.createdAt || Date.now(),
                 expiresAt: newExpiresAt,
                 lastExtendedAt: Date.now()
             });
@@ -1177,42 +1254,39 @@ async function handleAuthRoutes(req, res, url)
             }
 
             let ownerVerified = false;
+            let existingSession = null;
+
             if (isValidSession(oldToken, deviceUid, false))
             {
-                const existingSession = activeSessions.get(oldToken);
-                const existingEmailHash = existingSession?.emailHash || sha256(existingSession?.email || '');
-                if (existingSession && (!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
+                existingSession = activeSessions.get(oldToken);
+            }
+            else if (oldToken.startsWith('st1.'))
+            {
+                // VULN-25是正: ステートレスHMAC署名を厳格に検証（偽装署名・改ざんトークンを完全排除）
+                existingSession = verifyAndRestoreStatelessToken(oldToken);
+            }
+
+            if (existingSession)
+            {
+                const existingEmailHash = existingSession.emailHash || sha256(existingSession.email || '');
+                if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
                 {
                     ownerVerified = true;
                 }
             }
-            else if (oldToken.startsWith('st1.'))
-            {
-                try
-                {
-                    const parts = oldToken.split('.');
-                    if (parts.length === 3)
-                    {
-                        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-                        const payloadEmailHash = payload?.emailHash || sha256(payload?.email || '');
-                        if (payload && payload.uid === deviceUid && payloadEmailHash === emailHash && !isTokenRevoked(oldToken, payload.jti || ''))
-                        {
-                            ownerVerified = true;
-                        }
-                    }
-                }
-                catch (e) {}
-            }
 
             if (!ownerVerified)
             {
-                console.warn(`[Security Block] セッション所有者と異なるemail/UIDへの乗り換えを遮断: uid=${deviceUid}`);
+                console.warn(`[Security Block] 不正署名または所有者が異なるトークンでの再バインドを遮断: uid=${deviceUid}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'セッションの所有者情報が一致しません' }));
+                res.end(JSON.stringify({ success: false, error: 'セッションの署名検証に失敗したか、所有者情報が一致しません' }));
                 return true;
             }
 
-            const existingSession = activeSessions.get(oldToken);
+            // VULN-16是正: 旧トークンを失効リストに登録して即時無効化（ゾンビセッション化防止）
+            revokeSessionToken(oldToken);
+            activeSessions.delete(oldToken);
+
             const expiresAt = Date.now() + SESSION_DURATION_MS;
             const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
             const sessionObj = {
@@ -1224,7 +1298,6 @@ async function handleAuthRoutes(req, res, url)
                 lastExtendedAt: Date.now()
             };
             enforceMapSizeCap(activeSessions, 5000);
-            activeSessions.set(oldToken, sessionObj);
             activeSessions.set(newToken, sessionObj);
             saveSessions();
 
@@ -1301,7 +1374,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年10月28日 19時34分
+// 変更日時：2026年10月31日 12時12分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const WebSocket = require('ws');
@@ -1319,9 +1392,11 @@ const {
     users,
     enforceMapSizeCap,
     isValidSession,
+    verifyAndRestoreStatelessToken,
     extractBearerToken,
     saveOfflineQueue,
     saveOfflineReads,
+    saveAttachmentAcls,
     parseJsonBody
 } = __requireModule('./modules/stateStore');
 const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
@@ -1551,12 +1626,14 @@ async function handleChatAndFileRoutes(req, res, url)
                     text: data.text || '',
                     iv: data.iv || '',
                     cipher: data.cipher || '',
-                    imageBase64: data.imageBase64 || '',
+                    // VULN-50是正: FCM 4KBペイロード制限超過を防ぐため生画像Base64を除外
+                    hasImage: data.imageBase64 ? 'true' : '',
                     fileUrl: data.fileUrl || '',
-                    fileKey: data.fileKey || '',
+                    fileKey: '',
                     fileName: data.fileName || '',
                     fileSize: data.fileSize || '0',
                     senderPubKey: data.senderPubKey || '',
+                    senderPubSig: data.senderPubSig || '',
                     timestamp: data.timestamp || Date.now()
                 });
             }
@@ -1711,19 +1788,39 @@ async function handleChatAndFileRoutes(req, res, url)
             return true;
         }
 
-        // No.11対策: 送信者または宛先受信者以外の第三者によるダウンロード(IDOR)を遮断
-        const session = activeSessions.get(token);
+// VULN-04 & VULN-28 是正: 送信者または指定受信者以外の第三者によるダウンロード(IDOR)を完全遮断
+        let session = activeSessions.get(token);
+        if (!session && token.startsWith('st1.'))
+        {
+            session = verifyAndRestoreStatelessToken(token);
+        }
         const requesterUid = (session?.deviceUid || '').trim();
         const acl = attachmentAclStore.get(fileId);
-        if (acl && acl.uploaderUid && acl.targetUid && requesterUid)
+        if (acl)
         {
-            if (requesterUid !== acl.uploaderUid && requesterUid !== acl.targetUid)
+            if (!requesterUid)
             {
-                console.warn(`[Security Block] 権限のないユーザー(${requesterUid})による添付ファイル(${fileId})取得を遮断`);
+                console.warn(`[Security Block] 未認証またはUID特定不能なダウンロード要求を遮断: ${fileId}`);
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'アクセス権限がありません' }));
+                return true;
+            }
+            const isUploader = (acl.uploaderUid && requesterUid === acl.uploaderUid);
+            const isTarget = (acl.targetUid && requesterUid === acl.targetUid);
+            if (!isUploader && !isTarget)
+            {
+                console.warn(`[Security Block] 権限のないユーザー(${requesterUid})による添付ファイル(${fileId})取得を遮断 (uploader=${acl.uploaderUid}, target=${acl.targetUid})`);
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'このファイルへのアクセス権限がありません' }));
                 return true;
             }
+        }
+        else
+        {
+            console.warn(`[Security Block] ACL情報が存在しない添付ファイル(${fileId})へのダウンロード要求を安全のため遮断`);
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'ファイルのアクセス権限が見つかりません' }));
+            return true;
         }
 
         const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
@@ -1769,6 +1866,7 @@ setInterval(() =>
                     {
                         fs.unlinkSync(fp);
                         attachmentAclStore.delete(f.slice(0, -4));
+                        saveAttachmentAcls();
                         console.log(`[File Cleanup] 期限切れ一時暗号化ファイルを自動消去: ${f}`);
                     }
                 }
@@ -1790,7 +1888,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年10月28日 19時34分
+// 変更日時：2026年10月31日 12時18分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -1836,7 +1934,7 @@ function removeClientFromRoom(ws, roomId, userId) {
 
 // WebSocketサーバーの初期化と全イベントバインド
 function setupWebSocketServer(server) {
-    const wss = new WebSocket.Server({ server, maxPayload: 1 * 1024 * 1024 });
+    const wss = new WebSocket.Server({ server, maxPayload: 512 * 1024 });
 
     // 25秒間隔のハートビートPing
     const heartbeatInterval = setInterval(() => {
@@ -1882,6 +1980,13 @@ function setupWebSocketServer(server) {
 
         ws.on('message', (message) => {
             try {
+                // VULN-48是正: 巨大パケットの同期JSONパースによるイベントループブロッキングDoSを遮断
+                if (message.length > 512 * 1024) {
+                    console.warn(`[Security Block] 許容サイズ(512KB)超過のWebSocketパケットを遮断: size=${message.length}`);
+                    ws.close(1009, 'Message too big');
+                    return;
+                }
+
                 const now = Date.now();
                 if (now - ws.rateLimitWindowStart > 1000) {
                     ws.rateLimitWindowStart = now;
@@ -2039,7 +2144,7 @@ function setupWebSocketServer(server) {
                         return;
                     }
 
-                    if (message.length > 35 * 1024 * 1024) {
+                    if (message.length > 512 * 1024) {
                         console.warn(`[Security Block] 許容サイズ(35MB)超過の巨大メッセージを破棄: ${data.fromUserId}`);
                         return;
                     }
@@ -2105,12 +2210,14 @@ function setupWebSocketServer(server) {
                                 text: data.text || '',
                                 iv: data.iv || '',
                                 cipher: data.cipher || '',
-                                imageBase64: data.imageBase64 || '',
+                                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
+                                hasImage: data.imageBase64 ? 'true' : '',
                                 fileUrl: data.fileUrl || '',
-                                fileKey: data.fileKey || '',
+                                fileKey: '',
                                 fileName: data.fileName || '',
                                 fileSize: data.fileSize || '0',
                                 senderPubKey: data.senderPubKey || '',
+                                senderPubSig: data.senderPubSig || '',
                                 timestamp: data.timestamp || Date.now()
                             });
                         }
@@ -2122,6 +2229,27 @@ function setupWebSocketServer(server) {
                                 timestamp: Date.now()
                             }));
                         }
+                    }
+                    return;
+                }
+
+                // 4.9. 暗号鍵不一致(復号失敗)エラー通知中継
+                if (type === 'chat_decrypt_error') {
+                    const regUid = (currentUserId || '').trim();
+                    const fromUserId = regUid || (data.fromUserId || '').trim();
+                    const targetUserId = (data.targetUserId || data.targetId || '').trim();
+                    const messageId = (data.messageId || '').trim();
+                    if (!targetUserId || !messageId) { return; }
+
+                    const targetEntry = users.get(targetUserId);
+                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                        targetEntry.ws.send(JSON.stringify({
+                            type: 'chat_decrypt_error',
+                            fromUserId: fromUserId,
+                            targetUserId: targetUserId,
+                            messageId: messageId,
+                            timestamp: Date.now()
+                        }));
                     }
                     return;
                 }
@@ -2201,30 +2329,8 @@ function setupWebSocketServer(server) {
                     currentUserId = userId;
                     ws.userId = userId;
 
-                    if (room.size === 0 && roomId) {
-                        const allUids = roomId.match(/u_[a-zA-Z0-9]+/g) || [];
-                        const targetUid = allUids.find(id => id !== userId);
-                        if (targetUid) {
-                            const callerName = data.userName || users.get(userId)?.name || '友だち';
-                            const targetEntry = users.get(targetUid);
-                            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                                targetEntry.ws.send(JSON.stringify({
-                                    type: 'incoming_call',
-                                    fromUserId: userId,
-                                    fromName: callerName,
-                                    roomId: roomId
-                                }));
-                            }
-                            const targetFcm = fcmTokenStore.get(targetUid) || fcmTokenStore.get(targetUid.trim());
-                            if (targetFcm && targetFcm.fcmToken) {
-                                sendIncomingCallPush(targetFcm.fcmToken, {
-                                    fromUserId: userId,
-                                    fromName: callerName,
-                                    roomId: roomId
-                                });
-                            }
-                        }
-                    }
+                    // VULN-29是正: joinパケット単体での無検証incoming_callおよびFCM自動発火を廃止
+                    // （着信通知はcall_inviteによる厳格なタイムスタンプ・Nonce・署名検証シーケンスのみで行う）
 
                     const isCaller = !!data.isCaller;
                     room.forEach((client) => {
@@ -2309,7 +2415,7 @@ return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Main: server.js] ====================
-// 変更日時：2026年10月28日 20時03分
+// 変更日時：2026年10月31日 12時20分
 // WebRTC Signaling Server エントリポイント (モジュール分割リファクタリング版)
 // 【AI厳守ルール】本ファイルまたは ./modules/*.js を変更した際は、必ず `node scripts/bundle_server_for_github.js` を実行し、
 // `server/server_single_for_github.js` に最新の変更内容を完全上書き反映すること（詳細は「サーバー更新指示書.txt」参照）。
@@ -2338,21 +2444,33 @@ const server = http.createServer(async (req, res) =>
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     res.setHeader('Content-Security-Policy', "default-src 'none'");
 
-    // CORSヘッダー付与
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Uid, X-Target-Uid');
+    // VULN-52是正: CORSワイルドカード(*)を撤廃し、特定信頼オリジンまたはネイティブアプリ直接通信のみ許可
+    const origin = req.headers['origin'];
+    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (origin && allowedOrigins.includes(origin))
+    {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Uid, X-Target-Uid');
+    }
 
     if (req.method === 'OPTIONS')
     {
-        res.writeHead(204);
+        if (origin && allowedOrigins.includes(origin))
+        {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        res.writeHead(403);
         res.end();
         return;
     }
 
-    // IP接続レート制限 (1分間に最大60リクエストまで + Mapサイズ上限保護)
+    // VULN-37是正: 偽装X-Forwarded-For対策。プロキシ環境下で直近ホストまたはソケットIPを優先評価
     const rawForwarded = req.headers['x-forwarded-for'];
-    const clientIp = (rawForwarded ? rawForwarded.split(',')[0].trim() : null) || req.socket.remoteAddress || 'unknown';
+    const forwardedIps = rawForwarded ? rawForwarded.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const clientIp = (forwardedIps.length > 0 ? forwardedIps[forwardedIps.length - 1] : null) || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
     let ipRecord = ipConnectionTracker.get(clientIp);
     if (!ipRecord || now > ipRecord.resetTime)
