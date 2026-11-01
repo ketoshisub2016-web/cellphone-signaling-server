@@ -1,4 +1,4 @@
-// 変更日時：2026年11月01日 23時53分
+// 変更日時：2026年11月02日 01時05分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -2071,7 +2071,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月01日 22時25分
+// 変更日時：2026年11月02日 01時05分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -2276,8 +2276,11 @@ function setupWebSocketServer(server) {
                     let forwardedViaWs = false;
 
                     // VULN-86是正: 通話roomIdの厳格検証 (callerUid・targetUserIdの正規性照合 ＆ 第三者UID混入遮断)
-                    const inviteUids = (typeof data.roomId === 'string' ? data.roomId.match(/u_[a-zA-Z0-9]+/g) : null) || [];
-                    if (inviteUids.length === 0 || inviteUids.length > 2 || !inviteUids.includes(callerUid) || (targetUserId && !inviteUids.includes(targetUserId))) {
+                    const roomStr = typeof data.roomId === 'string' ? data.roomId.trim() : '';
+                    const inviteUids = roomStr ? roomStr.split('_').filter(Boolean) : [];
+                    const hasCaller = inviteUids.includes(callerUid) || roomStr.includes(callerUid);
+                    const hasTarget = !targetUserId || inviteUids.includes(targetUserId) || roomStr.includes(targetUserId);
+                    if (!roomStr || inviteUids.length === 0 || !hasCaller || !hasTarget) {
                         console.warn(`[Call Invite Rejected] 不正なroomId指定を遮断: caller=${callerUid}, target=${targetUserId}, room=${data.roomId}`);
                         return;
                     }
@@ -2498,10 +2501,12 @@ function setupWebSocketServer(server) {
                         return;
                     }
 
-                    // VULN-60 & VULN-86是正: 通話ルーム(uidA_uidB)の厳格な正規表現UID検証 (1〜2名限定 ＆ 参加権限照合)
-                    const allowedUids = (typeof roomId === 'string' ? roomId.match(/u_[a-zA-Z0-9]+/g) : null) || [];
-                    if (allowedUids.length === 0 || allowedUids.length > 2 || !allowedUids.includes(userId)) {
-                        console.warn(`[Security Block] 権限のない通話ルームへの不正Join(UID数不備または未認可UID)を遮断: User=${userId}, Room=${roomId}`);
+                    // VULN-60 & VULN-86是正: 通話ルーム(uidA_uidB)の厳格な検証 (参加権限照合)
+                    const roomStr = typeof roomId === 'string' ? roomId.trim() : '';
+                    const allowedUids = roomStr ? roomStr.split('_').filter(Boolean) : [];
+                    const hasUser = allowedUids.includes(userId) || roomStr.includes(userId);
+                    if (!roomStr || allowedUids.length === 0 || !hasUser) {
+                        console.warn(`[Security Block] 権限のない通話ルームへの不正Join(未認可UID)を遮断: User=${userId}, Room=${roomId}`);
                         ws.send(JSON.stringify({ type: 'error', message: 'Forbidden room access' }));
                         ws.close(4003, 'Forbidden room access');
                         return;
