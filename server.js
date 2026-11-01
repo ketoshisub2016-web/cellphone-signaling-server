@@ -1,4 +1,4 @@
-// 変更日時：2026年11月01日 22時24分
+// 変更日時：2026年11月01日 23時53分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
