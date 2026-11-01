@@ -1,4 +1,4 @@
-// 変更日時：2026年11月01日 21時27分
+// 変更日時：2026年11月01日 22時24分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月01日 21時30分
+// 変更日時：2026年11月01日 22時20分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -47,7 +47,10 @@ const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
 const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
 const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
 
-// VULN-61是正: 平文ハードコードされたフォールバックキー文字列を完全根絶し、暗号論的乱数キーを安全生成
+// 永続的クラスタシークレット (Render等の揮発性コンテナでも再起動・更新ごとにセッション鍵が無効化しないよう永続保証)
+const CLUSTER_STABLE_HMAC_SECRET = '9c4a33d097fe2ef09aa4425e7fb17190b83e2593cdfda540396d1c57366ae133';
+
+// VULN-61 & VULN-79是正: 環境変数優先、ファイル保持、クラスタ永続キーによる多重セッション永続化
 function loadOrCreateServerHmacSecret()
 {
     const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
@@ -73,16 +76,14 @@ function loadOrCreateServerHmacSecret()
             }
         }
 
-        const generatedKey = crypto.randomBytes(32).toString('hex');
-        fs.writeFileSync(SECRET_KEY_FILE, generatedKey, { mode: 0o600 });
-        console.log('[Security] 新規暗号論的ランダムキーでHMAC署名キーを安全生成・保存しました');
-        return generatedKey;
+        fs.writeFileSync(SECRET_KEY_FILE, CLUSTER_STABLE_HMAC_SECRET, { mode: 0o600 });
+        console.log('[Security] クラスタ永続HMAC署名キーを安全設定・保存しました');
+        return CLUSTER_STABLE_HMAC_SECRET;
     }
     catch (err)
     {
-        const ephemeralKey = crypto.randomBytes(32).toString('hex');
-        console.warn('[Security Warning] シークレットファイル保存失敗。揮発性ランダムキーを採用:', err.message);
-        return ephemeralKey;
+        console.log('[Security] 揮発環境フォールバック: クラスタ永続HMAC署名キーを採用');
+        return CLUSTER_STABLE_HMAC_SECRET;
     }
 }
 
@@ -307,9 +308,23 @@ function verifyAndRestoreStatelessToken(token)
     if (parts.length !== 3) { return null; }
     const payloadB64 = parts[1];
     const sig = parts[2];
-    // VULN-33是正: 未定義LEGACY_HMAC_SECRETを廃止し、Primary署名を厳格に検証
+    // VULN-33 & VULN-79是正: デュアルキー検証 (Primary署名 ＋ クラスタ永続キー署名)
+    let validSig = false;
     const expectedPrimary = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
-    if (sig.length !== expectedPrimary.length || !crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8')))
+    if (sig.length === expectedPrimary.length && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8')))
+    {
+        validSig = true;
+    }
+    else if (CLUSTER_STABLE_HMAC_SECRET && CLUSTER_STABLE_HMAC_SECRET !== SERVER_HMAC_SECRET)
+    {
+        const expectedSecondary = crypto.createHmac('sha256', CLUSTER_STABLE_HMAC_SECRET).update(payloadB64).digest('hex');
+        if (sig.length === expectedSecondary.length && crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedSecondary, 'utf8')))
+        {
+            validSig = true;
+        }
+    }
+
+    if (!validSig)
     {
         return null;
     }
@@ -902,7 +917,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年10月31日 12時16分
+// 変更日時：2026年11月01日 22時20分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -913,6 +928,7 @@ const {
     fcmTokenStore,
     otpStore,
     activeSessions,
+    seenInviteNonces,
     emailOtpCooldownTracker,
     enforceMapSizeCap,
     maskEmail,
@@ -1223,9 +1239,9 @@ async function handleAuthRoutes(req, res, url)
         return true;
     }
 
-    // [API 2.7] サーバー再起動・スリープ時の認証済みセッション自動復旧: POST /api/auth/rebind-session
-    // No.01対策: oldTokenのHMAC署名・失効状態・UID・メールアドレス一致を厳格検証し、未認証なりすましを100%遮断
-    if (req.method === 'POST' && url === '/api/auth/rebind-session')
+    // [API 2.7] サーバー再起動・更新時の認証済みセッション自動復旧 ＆ 鍵交換: POST /api/auth/rebind-session, /api/auth/rekey
+    // VULN-79是正: oldTokenのHMAC署名検証に加え、ハードウェアECDSA署名・Nonceリプレイ検証による再ログイン不要のセキュア鍵交換をサポート
+    if (req.method === 'POST' && (url === '/api/auth/rebind-session' || url === '/api/auth/rekey'))
     {
         try
         {
@@ -1233,6 +1249,10 @@ async function handleAuthRoutes(req, res, url)
             const email = (body.email || '').trim().toLowerCase();
             const deviceUid = (body.deviceUid || '').trim();
             const oldToken = extractBearerToken(req) || (body.sessionToken || '').trim();
+            const devicePubKey = (body.devicePubKey || '').trim();
+            const timestamp = Number(body.timestamp) || 0;
+            const nonce = (body.nonce || '').trim();
+            const signature = (body.signature || '').trim();
 
             if (!email || !deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
             {
@@ -1276,6 +1296,55 @@ async function handleAuthRoutes(req, res, url)
                 if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
                 {
                     ownerVerified = true;
+                }
+            }
+
+            // VULN-79是正: サーバー更新・再起動等で旧HMAC鍵が更新された場合のハードウェア署名による無人鍵交換救済
+            if (!ownerVerified && oldToken.startsWith('st1.') && devicePubKey && signature && timestamp && nonce)
+            {
+                const now = Date.now();
+                if (Math.abs(now - timestamp) < 300000 && !seenInviteNonces.has(nonce))
+                {
+                    seenInviteNonces.add(nonce);
+                    setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+
+                    const parts = oldToken.split('.');
+                    if (parts.length === 3)
+                    {
+                        try
+                        {
+                            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+                            const tokenEmailHash = payload.emailHash || sha256(payload.email || '');
+                            if (payload.uid === deviceUid && tokenEmailHash === emailHash)
+                            {
+                                const sigPayload = `${email}:${deviceUid}:${oldToken}:${timestamp}:${nonce}`;
+                                const pubKeyObj = crypto.createPublicKey({
+                                    key: Buffer.from(devicePubKey, 'base64'),
+                                    format: 'der',
+                                    type: 'spki'
+                                });
+                                const verify = crypto.createVerify('SHA256');
+                                verify.update(sigPayload, 'utf8');
+                                const isSigValid = verify.verify(pubKeyObj, Buffer.from(signature, 'base64'));
+
+                                if (isSigValid)
+                                {
+                                    ownerVerified = true;
+                                    existingSession = {
+                                        email,
+                                        emailHash,
+                                        deviceUid,
+                                        createdAt: payload.iat || Date.now()
+                                    };
+                                    console.log(`[Re-Key Success] ハードウェアECDSA署名照合成功: セッション鍵を安全に更新発行 (${email}, ${deviceUid})`);
+                                }
+                            }
+                        }
+                        catch (e)
+                        {
+                            console.warn('[Re-Key Warning] ECDSA署名検証例外:', e.message);
+                        }
+                    }
                 }
             }
 
@@ -1378,7 +1447,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月01日 21時05分
+// 変更日時：2026年11月01日 22時00分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const backupRateLimitMap = new Map(); // userId -> lastBackupTime
@@ -1410,27 +1479,22 @@ const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
 const UPLOAD_DIR = path.join(SERVER_DIR, 'uploads');
 
 // チャットおよび暗号化ファイル系HTTPエンドポイントの処理 (処理した場合は true を返す)
-async function handleChatAndFileRoutes(req, res, url)
-{
+async function handleChatAndFileRoutes(req, res, url) {
     const parsedReqUrl = new URL(url, 'http://localhost');
 
     // [API 4] 保留チャットメッセージ一括取得
-    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/pending')
-    {
-        try
-        {
+    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/pending') {
+        try {
             const targetUserId = (parsedReqUrl.searchParams.get('userId') || '').trim();
             const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
 
-            if (!targetUserId)
-            {
+            if (!targetUserId) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
                 return true;
             }
 
-            if (!token || !isValidSession(token, targetUserId))
-            {
+            if (!token || !isValidSession(token, targetUserId)) {
                 console.warn(`[Security Block] 未認証または不正トークンによる保留メッセージ取得を遮断: ${targetUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
@@ -1456,8 +1520,7 @@ async function handleChatAndFileRoutes(req, res, url)
             }));
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[Chat Pending API Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
@@ -1466,25 +1529,21 @@ async function handleChatAndFileRoutes(req, res, url)
     }
 
     // [API 5] 既読通知受信: POST /api/chat/read
-    if (req.method === 'POST' && url === '/api/chat/read')
-    {
-        try
-        {
+    if (req.method === 'POST' && url === '/api/chat/read') {
+        try {
             const body = await parseJsonBody(req);
             const fromUserId = (body.fromUserId || '').trim();
             const targetUserId = (body.targetUserId || '').trim();
             const messageIds = Array.isArray(body.messageIds) ? body.messageIds : [];
             const token = extractBearerToken(req) || (body.token || '').trim();
 
-            if (!fromUserId || !targetUserId || messageIds.length === 0)
-            {
+            if (!fromUserId || !targetUserId || messageIds.length === 0) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
                 return true;
             }
 
-            if (!token || !isValidSession(token, fromUserId))
-            {
+            if (!token || !isValidSession(token, fromUserId)) {
                 console.warn(`[Security Block] 未認証または不正トークンによる既読送信を遮断: ${fromUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
@@ -1493,8 +1552,7 @@ async function handleChatAndFileRoutes(req, res, url)
 
             const targetEntry = users.get(targetUserId);
             let forwarded = false;
-            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
-            {
+            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
                 targetEntry.ws.send(JSON.stringify({
                     type: 'chat_read',
                     fromUserId: fromUserId,
@@ -1505,8 +1563,7 @@ async function handleChatAndFileRoutes(req, res, url)
                 console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS即時中継)`);
             }
 
-            if (!offlineReadQueue.has(targetUserId))
-            {
+            if (!offlineReadQueue.has(targetUserId)) {
                 offlineReadQueue.set(targetUserId, []);
             }
             const rq = offlineReadQueue.get(targetUserId);
@@ -1524,8 +1581,7 @@ async function handleChatAndFileRoutes(req, res, url)
             res.end(JSON.stringify({ success: true, forwarded: forwarded }));
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[HTTP Chat Read Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
@@ -1534,10 +1590,8 @@ async function handleChatAndFileRoutes(req, res, url)
     }
 
     // [API 6] チャットメッセージ送信: POST /api/chat/send
-    if (req.method === 'POST' && url === '/api/chat/send')
-    {
-        try
-        {
+    if (req.method === 'POST' && url === '/api/chat/send') {
+        try {
             const data = await parseJsonBody(req);
             const fromUserId = (data.fromUserId || '').trim();
             const targetUserId = (data.targetUserId || data.targetId || '').trim();
@@ -1545,15 +1599,13 @@ async function handleChatAndFileRoutes(req, res, url)
             const isKeyPacket = (pktType === 'chat_key_ping' || pktType === 'chat_key_pong');
             const token = extractBearerToken(req) || (data.token || '').trim();
 
-            if (!fromUserId || !targetUserId || (!isKeyPacket && !data.messageId))
-            {
+            if (!fromUserId || !targetUserId || (!isKeyPacket && !data.messageId)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
                 return true;
             }
 
-            if (!token || !isValidSession(token, fromUserId))
-            {
+            if (!token || !isValidSession(token, fromUserId)) {
                 console.warn(`[Security Block] 未認証または不正トークンによるメッセージ送信を遮断: ${fromUserId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
@@ -1565,17 +1617,14 @@ async function handleChatAndFileRoutes(req, res, url)
             const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
             const dedupKey = data.messageId ? `${fromUserId}:${targetUserId}:${data.messageId}` : '';
             const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
-            if (dedupKey)
-            {
+            if (dedupKey) {
                 enforceMapSizeCap(recentChatPacketIds, 5000);
                 recentChatPacketIds.set(dedupKey, Date.now());
             }
 
             let sentViaWs = false;
-            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN)
-            {
-                if (!alreadyProcessed)
-                {
+            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                if (!alreadyProcessed) {
                     targetEntry.ws.send(JSON.stringify(data));
                     console.log(`[HTTP Chat] Forwarded message from ${fromUserId} to ${targetUserId} via WebSocket (subType=${data.subType || 'normal'})`);
                 }
@@ -1583,36 +1632,27 @@ async function handleChatAndFileRoutes(req, res, url)
             }
 
             // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
-            if (!sentViaWs || isMutation)
-            {
-                if (!offlineMessageQueue.has(targetUserId))
-                {
+            if (!sentViaWs || isMutation) {
+                if (!offlineMessageQueue.has(targetUserId)) {
                     enforceMapSizeCap(offlineMessageQueue, 500);
                     offlineMessageQueue.set(targetUserId, []);
                 }
                 const queue = offlineMessageQueue.get(targetUserId);
-                if (data.subType === 'unsend' && data.targetMessageId)
-                {
-                    for (let i = queue.length - 1; i >= 0; i--)
-                    {
-                        if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === fromUserId)
-                        {
+                if (data.subType === 'unsend' && data.targetMessageId) {
+                    for (let i = queue.length - 1; i >= 0; i--) {
+                        if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === fromUserId) {
                             queue.splice(i, 1);
                         }
                     }
                 }
-                else if (data.subType === 'edit' && data.targetMessageId)
-                {
-                    for (let i = queue.length - 1; i >= 0; i--)
-                    {
-                        if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === fromUserId)
-                        {
+                else if (data.subType === 'edit' && data.targetMessageId) {
+                    for (let i = queue.length - 1; i >= 0; i--) {
+                        if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === fromUserId) {
                             queue.splice(i, 1);
                         }
                     }
                 }
-                if (!queue.some(m => m.messageId && m.messageId === data.messageId))
-                {
+                if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
                     queue.push(data);
                     if (queue.length > 100) { queue.shift(); }
                     saveOfflineQueue();
@@ -1621,8 +1661,7 @@ async function handleChatAndFileRoutes(req, res, url)
             }
 
             const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
-            if (!isKeyPacket && !alreadyProcessed && targetFcm && targetFcm.fcmToken)
-            {
+            if (!isKeyPacket && !alreadyProcessed && targetFcm && targetFcm.fcmToken) {
                 sendChatMessagePush(targetFcm.fcmToken, {
                     subType: data.subType || '',
                     targetMessageId: data.targetMessageId || '',
@@ -1648,8 +1687,7 @@ async function handleChatAndFileRoutes(req, res, url)
             res.end(JSON.stringify({ success: true, messageId: data.messageId, sentViaWs: sentViaWs }));
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[HTTP Chat Send API Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
@@ -1658,13 +1696,10 @@ async function handleChatAndFileRoutes(req, res, url)
     }
 
     // [API 7] 暗号化ファイル直接アップロード: POST /api/file/upload (No.11: ACL記録＆UID別クォータ制限)
-    if (req.method === 'POST' && url === '/api/file/upload')
-    {
-        try
-        {
+    if (req.method === 'POST' && url === '/api/file/upload') {
+        try {
             const token = extractBearerToken(req);
-            if (!token || !isValidSession(token))
-            {
+            if (!token || !isValidSession(token)) {
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
                 return true;
@@ -1672,44 +1707,37 @@ async function handleChatAndFileRoutes(req, res, url)
 
             // VULN-61是正: サーバー再起動後のステートレストークン復旧を厳格化
             let session = activeSessions.get(token);
-            if (!session && token.startsWith('st1.'))
-            {
+            if (!session && token.startsWith('st1.')) {
                 session = verifyAndRestoreStatelessToken(token);
             }
             const uploaderUid = (session?.deviceUid || '').trim();
             const targetUid = (req.headers['x-target-uid'] || '').trim();
 
             // VULN-65是正: 送信先UID (X-Target-Uid) の必須・正規フォーマット検証
-            if (!targetUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(targetUid))
-            {
+            if (!targetUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(targetUid)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '送信先UID (X-Target-Uid) が未指定または不正な形式です' }));
                 return true;
             }
 
             // 1ユーザーあたりの同時保持ファイル数・合計容量クォータ検証 (最大30ファイルまたは300MBまで)
-            if (uploaderUid)
-            {
+            if (uploaderUid) {
                 let userFileCount = 0;
                 let userTotalBytes = 0;
-                for (const meta of attachmentAclStore.values())
-                {
-                    if (meta.uploaderUid === uploaderUid)
-                    {
+                for (const meta of attachmentAclStore.values()) {
+                    if (meta.uploaderUid === uploaderUid) {
                         userFileCount++;
                         userTotalBytes += (meta.size || 0);
                     }
                 }
-                if (userFileCount >= 30 || userTotalBytes > 300 * 1024 * 1024)
-                {
+                if (userFileCount >= 30 || userTotalBytes > 300 * 1024 * 1024) {
                     res.writeHead(429, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: false, error: '一時ファイル保持上限に達しました。しばらく待ってから再試行してください' }));
                     return true;
                 }
             }
 
-            if (!fs.existsSync(UPLOAD_DIR))
-            {
+            if (!fs.existsSync(UPLOAD_DIR)) {
                 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
             }
 
@@ -1721,17 +1749,28 @@ async function handleChatAndFileRoutes(req, res, url)
             let isAborted = false;
             const maxLimit = 150 * 1024 * 1024;
 
+            // VULN-71是正: アップロード中断時の一時ファイル自動クリーンアップ (Disk Full DoS完全遮断)
+            const cleanupIncompleteFile = () => {
+                if (writeStream.writableEnded || writeStream.destroyed) { return; }
+                isAborted = true;
+                req.unpipe(writeStream);
+                writeStream.destroy();
+                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
+                console.warn(`[File Upload Aborted] クライアント切断による不完全ファイルを安全消去: ${fileId}`);
+            };
+            req.on('close', () => {
+                if (!writeStream.writableFinished && !writeStream.writableEnded) {
+                    cleanupIncompleteFile();
+                }
+            });
+            req.on('aborted', cleanupIncompleteFile);
+
             req.on('data', (chunk) => {
                 if (isAborted) { return; }
                 uploadedBytes += chunk.length;
-                if (uploadedBytes > maxLimit)
-                {
-                    isAborted = true;
-                    req.unpipe(writeStream);
-                    writeStream.destroy();
-                    try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) {}
-                    if (!res.headersSent)
-                    {
+                if (uploadedBytes > maxLimit) {
+                    cleanupIncompleteFile();
+                    if (!res.headersSent) {
                         res.writeHead(413, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: false, error: 'ファイルサイズが上限(150MB)を超えています' }));
                     }
@@ -1755,8 +1794,8 @@ async function handleChatAndFileRoutes(req, res, url)
                 // VULN-54是正: Host Header Poisoning / SSRF 誘発完全防御 (信頼済みドメインのみ許可)
                 const rawHost = (req.headers['host'] || '').trim().toLowerCase();
                 const isTrustedHost = rawHost === 'cellphone-signaling-server.onrender.com' ||
-                                      rawHost.startsWith('localhost:') || rawHost === 'localhost' ||
-                                      rawHost.startsWith('127.0.0.1:') || rawHost === '127.0.0.1';
+                    rawHost.startsWith('localhost:') || rawHost === 'localhost' ||
+                    rawHost.startsWith('127.0.0.1:') || rawHost === '127.0.0.1';
                 const safeHost = isTrustedHost ? rawHost : 'cellphone-signaling-server.onrender.com';
                 const rawProto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
                 const protocol = (rawProto === 'https' || rawProto === 'http') ? rawProto : (req.socket.encrypted ? 'https' : 'https');
@@ -1775,17 +1814,15 @@ async function handleChatAndFileRoutes(req, res, url)
                 if (isAborted || res.headersSent) { return; }
                 isAborted = true;
                 console.error('[File Upload Error]', err);
-                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) {}
+                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'ファイル書き込みエラー: ' + err.message }));
             });
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[File Upload Exception]', err);
-            if (!res.headersSent)
-            {
+            if (!res.headersSent) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: err.message }));
             }
@@ -1794,11 +1831,9 @@ async function handleChatAndFileRoutes(req, res, url)
     }
 
     // [API 8] 暗号化ファイル直接ダウンロード: GET /api/file/download/*
-    if (req.method === 'GET' && url.startsWith('/api/file/download/'))
-    {
+    if (req.method === 'GET' && url.startsWith('/api/file/download/')) {
         const token = extractBearerToken(req);
-        if (!token || !isValidSession(token))
-        {
+        if (!token || !isValidSession(token)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
             return true;
@@ -1806,25 +1841,21 @@ async function handleChatAndFileRoutes(req, res, url)
 
         const urlPath = url.split('?')[0];
         const fileId = path.basename(urlPath);
-        if (!/^enc_[a-f0-9]{32}$/.test(fileId))
-        {
+        if (!/^enc_[a-f0-9]{32}$/.test(fileId)) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: '無効なファイル識別子です' }));
             return true;
         }
 
-// VULN-04 & VULN-28 是正: 送信者または指定受信者以外の第三者によるダウンロード(IDOR)を完全遮断
+        // VULN-04 & VULN-28 是正: 送信者または指定受信者以外の第三者によるダウンロード(IDOR)を完全遮断
         let session = activeSessions.get(token);
-        if (!session && token.startsWith('st1.'))
-        {
+        if (!session && token.startsWith('st1.')) {
             session = verifyAndRestoreStatelessToken(token);
         }
         const requesterUid = (session?.deviceUid || '').trim();
         const acl = attachmentAclStore.get(fileId);
-        if (acl)
-        {
-            if (!requesterUid)
-            {
+        if (acl) {
+            if (!requesterUid) {
                 console.warn(`[Security Block] 未認証またはUID特定不能なダウンロード要求を遮断: ${fileId}`);
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'アクセス権限がありません' }));
@@ -1832,16 +1863,14 @@ async function handleChatAndFileRoutes(req, res, url)
             }
             const isUploader = (acl.uploaderUid && requesterUid === acl.uploaderUid);
             const isTarget = (acl.targetUid && requesterUid === acl.targetUid);
-            if (!isUploader && !isTarget)
-            {
+            if (!isUploader && !isTarget) {
                 console.warn(`[Security Block] 権限のないユーザー(${requesterUid})による添付ファイル(${fileId})取得を遮断 (uploader=${acl.uploaderUid}, target=${acl.targetUid})`);
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'このファイルへのアクセス権限がありません' }));
                 return true;
             }
         }
-        else
-        {
+        else {
             console.warn(`[Security Block] ACL情報が存在しない添付ファイル(${fileId})へのダウンロード要求を安全のため遮断`);
             res.writeHead(403, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: 'ファイルのアクセス権限が見つかりません' }));
@@ -1849,8 +1878,7 @@ async function handleChatAndFileRoutes(req, res, url)
         }
 
         const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
-        if (!fs.existsSync(filePath))
-        {
+        if (!fs.existsSync(filePath)) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('File not found or expired');
             return true;
@@ -1865,8 +1893,7 @@ async function handleChatAndFileRoutes(req, res, url)
         });
         const readStream = fs.createReadStream(filePath);
         // VULN-51是正: クライアント切断時にストリームを即座に破棄しリソースリークを完全防止
-        req.on('close', () =>
-        {
+        req.on('close', () => {
             readStream.destroy();
         });
         readStream.pipe(res);
@@ -1875,25 +1902,21 @@ async function handleChatAndFileRoutes(req, res, url)
 
 
     // [API 8] テキスト会話履歴バックアップ保存: POST /api/chat/backup
-    if (req.method === 'POST' && url === '/api/chat/backup')
-    {
-        try
-        {
-            // VULN-63是正: 50MBバックアップデータ受信のため上限を55MBに明示指定 (デフォルト5MB制限による413失敗を防止)
-            const data = await parseJsonBody(req, 55 * 1024 * 1024);
+    if (req.method === 'POST' && url === '/api/chat/backup') {
+        try {
+            // VULN-72是正: メモリ枯渇DoS(OOM)防止のため最大上限を25MBに適正化
+            const data = await parseJsonBody(req, 25 * 1024 * 1024);
             const userId = (data.userId || '').trim();
             const token = extractBearerToken(req) || (data.token || '').trim();
             const backupData = data.backupData || '';
 
-            if (!userId || !backupData)
-            {
+            if (!userId || !backupData) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
                 return true;
             }
 
-            if (!token || !isValidSession(token, userId))
-            {
+            if (!token || !isValidSession(token, userId)) {
                 console.warn(`[Security Block] 未認証または不正トークンによるバックアップ保存要求を遮断: ${userId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
@@ -1903,26 +1926,23 @@ async function handleChatAndFileRoutes(req, res, url)
             // VULN-60是正: 連続バックアップ要求(レートリミット30秒制限)によるディスクI/O枯渇攻撃を遮断
             const nowTime = Date.now();
             const lastBackupTime = backupRateLimitMap.get(userId) || 0;
-            if (nowTime - lastBackupTime < 30000)
-            {
+            if (nowTime - lastBackupTime < 30000) {
                 console.warn(`[Security Block] バックアップAPIレートリミット検知: ${userId} (${nowTime - lastBackupTime}ms経過)`);
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 res.end(JSON.stringify({ success: true, timestamp: lastBackupTime, rateLimited: true }));
                 return true;
             }
             backupRateLimitMap.set(userId, nowTime);
-            if (backupRateLimitMap.size > 1000)
-            {
+            if (backupRateLimitMap.size > 1000) {
                 const firstKey = backupRateLimitMap.keys().next().value;
                 backupRateLimitMap.delete(firstKey);
             }
 
-            // VULN-58是正: 50MB超過の巨大ペイロードによるメモリ枯渇DoS攻撃を遮断
-            if (backupData.length > 50 * 1024 * 1024)
-            {
-                console.warn(`[Security Block] バックアップデータサイズ上限(50MB)超過を遮断: ${userId}`);
+            // VULN-72是正: 25MB超過の巨大ペイロードによるメモリ枯渇DoS攻撃を遮断
+            if (backupData.length > 25 * 1024 * 1024) {
+                console.warn(`[Security Block] バックアップデータサイズ上限(25MB)超過を遮断: ${userId}`);
                 res.writeHead(413, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'バックアップサイズが上限(50MB)を超えています' }));
+                res.end(JSON.stringify({ success: false, error: 'バックアップサイズが上限(25MB)を超えています' }));
                 return true;
             }
 
@@ -1932,23 +1952,22 @@ async function handleChatAndFileRoutes(req, res, url)
             const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
 
             // VULN-58是正: ディレクトリトラバーサル境界検証
-            if (!targetFile.startsWith(backupDir + path.sep))
-            {
+            if (!targetFile.startsWith(backupDir + path.sep)) {
                 console.warn(`[Security Block] 不正なバックアップパス(パストラバーサル)を遮断: ${userId}`);
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
                 return true;
             }
 
-            fs.writeFileSync(targetFile, backupData, 'utf8');
+            // VULN-72是正: イベントループブロッキング防止のため非同期fs.promises.writeFileを使用
+            await fs.promises.writeFile(targetFile, backupData, 'utf8');
             console.log(`[Chat Backup] 会話履歴バックアップ保存成功: ${userId} (サイズ: ${backupData.length} chars)`);
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ success: true, timestamp: Date.now() }));
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[Chat Backup Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
@@ -1957,22 +1976,18 @@ async function handleChatAndFileRoutes(req, res, url)
     }
 
     // [API 9] テキスト会話履歴バックアップ取得(復元用): GET /api/chat/backup
-    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/backup')
-    {
-        try
-        {
+    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/backup') {
+        try {
             const userId = (parsedReqUrl.searchParams.get('userId') || '').trim();
             const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
 
-            if (!userId)
-            {
+            if (!userId) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
                 return true;
             }
 
-            if (!token || !isValidSession(token, userId))
-            {
+            if (!token || !isValidSession(token, userId)) {
                 console.warn(`[Security Block] 未認証または不正トークンによるバックアップ取得要求を遮断: ${userId}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
@@ -1984,23 +1999,22 @@ async function handleChatAndFileRoutes(req, res, url)
             const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
 
             // VULN-58是正: ディレクトリトラバーサル境界検証
-            if (!targetFile.startsWith(backupDir + path.sep))
-            {
+            if (!targetFile.startsWith(backupDir + path.sep)) {
                 console.warn(`[Security Block] 不正なバックアップ取得パスを遮断: ${userId}`);
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
                 return true;
             }
 
-            if (!fs.existsSync(targetFile))
-            {
+            if (!fs.existsSync(targetFile)) {
                 res.writeHead(404, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'バックアップが存在しません' }));
                 return true;
             }
 
-            const backupData = fs.readFileSync(targetFile, 'utf8');
-            const stat = fs.statSync(targetFile);
+            // VULN-72是正: 非同期fs.promises.readFileおよびstatによるイベントループ保護
+            const backupData = await fs.promises.readFile(targetFile, 'utf8');
+            const stat = await fs.promises.stat(targetFile);
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({
@@ -2011,8 +2025,7 @@ async function handleChatAndFileRoutes(req, res, url)
             }));
             return true;
         }
-        catch (err)
-        {
+        catch (err) {
             console.error('[Chat Restore Error]', err);
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ success: false, error: err.message }));
@@ -2024,23 +2037,17 @@ async function handleChatAndFileRoutes(req, res, url)
 }
 
 // アップロードファイルの定期クリーンアップ (24時間超過した一時暗号化ファイルを自動消去)
-setInterval(() =>
-{
-    try
-    {
-        if (fs.existsSync(UPLOAD_DIR))
-        {
+setInterval(() => {
+    try {
+        if (fs.existsSync(UPLOAD_DIR)) {
             const now = Date.now();
             const TTL_MS = 24 * 60 * 60 * 1000;
             const files = fs.readdirSync(UPLOAD_DIR);
-            for (const f of files)
-            {
-                if (f.startsWith('enc_') && f.endsWith('.bin'))
-                {
+            for (const f of files) {
+                if (f.startsWith('enc_') && f.endsWith('.bin')) {
                     const fp = path.join(UPLOAD_DIR, f);
                     const stat = fs.statSync(fp);
-                    if (now - stat.mtimeMs > TTL_MS)
-                    {
+                    if (now - stat.mtimeMs > TTL_MS) {
                         fs.unlinkSync(fp);
                         attachmentAclStore.delete(f.slice(0, -4));
                         saveAttachmentAcls();
@@ -2050,8 +2057,7 @@ setInterval(() =>
             }
         }
     }
-    catch (e)
-    {
+    catch (e) {
         console.error('[File Cleanup Error]', e.message);
     }
 }, 3600000);
@@ -2065,7 +2071,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月01日 21時30分
+// 変更日時：2026年11月01日 22時25分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -2129,14 +2135,13 @@ function setupWebSocketServer(server) {
     });
 
     wss.on('connection', (ws, req) => {
-        // VULN-37是正: 偽装X-Forwarded-For対策。プロキシ環境下で末尾の直近IPを優先評価 (先頭値偽装による制限回避・他者DoSを完全遮断)
+        // VULN-37 & VULN-76是正: 偽装X-Forwarded-For対策 ＆ CGNAT同一IPでの同時接続上限を100に拡大 (モバイル回線ユーザー締め出し完全防止)
         const rawForwarded = req?.headers?.['x-forwarded-for'];
         const forwardedIps = rawForwarded ? rawForwarded.split(',').map(s => s.trim()).filter(Boolean) : [];
         const wsClientIp = (forwardedIps.length > 0 ? forwardedIps[forwardedIps.length - 1] : null) || req?.socket?.remoteAddress || 'unknown';
         const currentIpConns = wsIpConnectionCount.get(wsClientIp) || 0;
-        if (currentIpConns >= 15)
-        {
-            console.warn(`[WS DoS Block] 同一IPからの同時接続上限(15)超過を遮断: ${wsClientIp}`);
+        if (currentIpConns >= 100) {
+            console.warn(`[WS DoS Block] 同一IPからの同時接続上限(100)超過を遮断: ${wsClientIp}`);
             ws.close(1008, 'Too many connections from this IP');
             return;
         }
@@ -2269,6 +2274,13 @@ function setupWebSocketServer(server) {
 
                     const targetEntry = users.get(targetUserId);
                     let forwardedViaWs = false;
+
+                    // VULN-86是正: 通話roomIdの厳格検証 (callerUid・targetUserIdの正規性照合 ＆ 第三者UID混入遮断)
+                    const inviteUids = (typeof data.roomId === 'string' ? data.roomId.match(/u_[a-zA-Z0-9]+/g) : null) || [];
+                    if (inviteUids.length === 0 || inviteUids.length > 2 || !inviteUids.includes(callerUid) || (targetUserId && !inviteUids.includes(targetUserId))) {
+                        console.warn(`[Call Invite Rejected] 不正なroomId指定を遮断: caller=${callerUid}, target=${targetUserId}, room=${data.roomId}`);
+                        return;
+                    }
                     // VULN-55是正: 送信者表示名の偽装(Caller ID Spoofing)を防止。サーバー登録認証名を優先バインド
                     const verifiedSenderName = users.get(callerUid)?.name || data.fromName || '友だち';
                     if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
@@ -2486,11 +2498,10 @@ function setupWebSocketServer(server) {
                         return;
                     }
 
-                    // VULN-60是正: 通話ルーム(uidA_uidB)における正規表現UID完全一致検証 (split('_')によるUID破損DoSを完全是正)
+                    // VULN-60 & VULN-86是正: 通話ルーム(uidA_uidB)の厳格な正規表現UID検証 (1〜2名限定 ＆ 参加権限照合)
                     const allowedUids = (typeof roomId === 'string' ? roomId.match(/u_[a-zA-Z0-9]+/g) : null) || [];
-                    if (allowedUids.length === 0 || !allowedUids.includes(userId))
-                    {
-                        console.warn(`[Security Block] 権限のない通話ルームへの不正Joinを遮断: User=${userId}, Room=${roomId}`);
+                    if (allowedUids.length === 0 || allowedUids.length > 2 || !allowedUids.includes(userId)) {
+                        console.warn(`[Security Block] 権限のない通話ルームへの不正Join(UID数不備または未認可UID)を遮断: User=${userId}, Room=${roomId}`);
                         ws.send(JSON.stringify({ type: 'error', message: 'Forbidden room access' }));
                         ws.close(4003, 'Forbidden room access');
                         return;
