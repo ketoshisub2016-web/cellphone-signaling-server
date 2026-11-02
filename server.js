@@ -1,4 +1,4 @@
-// 変更日時：2026年11月02日 01時05分
+// 変更日時：2026年11月02日 12時25分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月01日 22時20分
+// 変更日時：2026年11月02日 12時00分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -656,6 +656,9 @@ module.exports = {
     saveFcmTokens,
     saveOfflineReads,
     saveAttachmentAcls,
+    profileStore,
+    saveProfiles,
+    loadProfiles,
     parseJsonBody,
     flushAllStoresSync
 };
@@ -1447,7 +1450,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月01日 22時00分
+// 変更日時：2026年11月02日 12時26分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const backupRateLimitMap = new Map(); // userId -> lastBackupTime
@@ -1472,6 +1475,8 @@ const {
     saveOfflineQueue,
     saveOfflineReads,
     saveAttachmentAcls,
+    profileStore,
+    saveProfiles,
     parseJsonBody
 } = __requireModule('./modules/stateStore');
 const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
@@ -2033,6 +2038,137 @@ async function handleChatAndFileRoutes(req, res, url) {
         }
     }
 
+
+    // [API 10] プロフィール更新 (暗号化アバター・名前のサーバー安全保管)
+    if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/update') {
+        try {
+            const token = extractBearerToken(req);
+            const body = await parseJsonBody(req);
+            const userId = (body.userId || '').trim();
+            const name = (body.name || '').trim();
+            const avatarEnc = (body.avatarEnc || '').trim();
+            const avatarHash = (body.avatarHash || '').trim();
+            const timestamp = Number(body.timestamp) || Date.now();
+            const signature = (body.signature || '').trim();
+
+            if (!userId || !token || !isValidSession(token, userId)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                return true;
+            }
+
+            if (!name && !avatarEnc && !avatarHash) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '更新データがありません' }));
+                return true;
+            }
+
+            const existing = profileStore.get(userId) || {};
+            const profileData = {
+                userId: userId,
+                name: name || existing.name || '',
+                avatarEnc: avatarEnc !== undefined ? avatarEnc : (existing.avatarEnc || ''),
+                avatarHash: avatarHash || existing.avatarHash || '',
+                timestamp: timestamp,
+                signature: signature || existing.signature || ''
+            };
+
+            profileStore.set(userId, profileData);
+            enforceMapSizeCap(profileStore, 10000);
+            saveProfiles();
+            // ※相手への変更通知は行わず、一覧取得時等のサイレント差分同期のみ
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, timestamp: timestamp }));
+            return true;
+        } catch (e) {
+            console.error('[Profile Update Error]', e);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+            return true;
+        }
+    }
+
+    // [API 11] プロフィール一括取得 (友達一覧のアバター・名前一括同期)
+    if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/batch') {
+        try {
+            const token = extractBearerToken(req);
+            const body = await parseJsonBody(req);
+            const requesterUid = (body.requesterUid || '').trim();
+            const userIds = Array.isArray(body.userIds) ? body.userIds : [];
+            const knownHashes = (body.knownHashes && typeof body.knownHashes === 'object') ? body.knownHashes : {};
+
+            if (!token || !isValidSession(token, requesterUid)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                return true;
+            }
+
+            const result = {};
+            for (const uid of userIds) {
+                const cleanUid = (uid || '').trim();
+                if (!cleanUid) continue;
+                const prof = profileStore.get(cleanUid);
+                if (prof) {
+                    const clientHash = knownHashes[cleanUid] || '';
+                    const isUnchanged = !!(clientHash && prof.avatarHash && clientHash === prof.avatarHash);
+                    result[cleanUid] = {
+                        userId: prof.userId,
+                        name: prof.name,
+                        avatarEnc: isUnchanged ? null : prof.avatarEnc,
+                        avatarHash: prof.avatarHash,
+                        timestamp: prof.timestamp,
+                        signature: prof.signature,
+                        unchanged: isUnchanged
+                    };
+                }
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ success: true, profiles: result }));
+            return true;
+        } catch (e) {
+            console.error('[Profile Batch Error]', e);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+            return true;
+        }
+    }
+
+    // [API 12] 単一プロフィール取得
+    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/profile/get') {
+        try {
+            const token = extractBearerToken(req);
+            const targetUid = (parsedReqUrl.searchParams.get('userId') || '').trim();
+            const requesterUid = (parsedReqUrl.searchParams.get('requesterUid') || '').trim();
+
+            if (!token || !isValidSession(token, requesterUid || targetUid)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                return true;
+            }
+
+            const prof = profileStore.get(targetUid);
+            if (!prof) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'プロフィールが見つかりません' }));
+                return true;
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                success: true,
+                profile: prof
+            }));
+            return true;
+        } catch (e) {
+            console.error('[Profile Get Error]', e);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -2071,7 +2207,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月02日 01時05分
+// 変更日時：2026年11月02日 12時26分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
