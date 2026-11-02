@@ -1,4 +1,4 @@
-// 変更日時：2026年11月02日 13時14分
+// 変更日時：2026年11月02日 13時47分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -1450,7 +1450,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月02日 12時26分
+// 変更日時：2026年11月02日 13時48分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const backupRateLimitMap = new Map(); // userId -> lastBackupTime
@@ -1719,7 +1719,7 @@ async function handleChatAndFileRoutes(req, res, url) {
             const targetUid = (req.headers['x-target-uid'] || '').trim();
 
             // VULN-65是正: 送信先UID (X-Target-Uid) の必須・正規フォーマット検証
-            if (!targetUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(targetUid)) {
+            if (!targetUid || !/^(u_[a-zA-Z0-9]{8,40}|bot_[a-zA-Z0-9_]{3,30})$/.test(targetUid)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '送信先UID (X-Target-Uid) が未指定または不正な形式です' }));
                 return true;
