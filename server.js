@@ -1,4 +1,4 @@
-// 変更日時：2026年11月04日 04時07分
+// 変更日時：2026年11月04日 04時53分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -2077,7 +2077,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月04日 04時00分
+// 変更日時：2026年11月04日 04時55分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -2275,6 +2275,10 @@ function setupWebSocketServer(server) {
                         console.warn(`[Call Invite Rejected] Nonce重複リプレイ攻撃検知: nonce=${nonce} from ${fromUserId}`);
                         return;
                     }
+                    if (seenInviteNonces.size >= 10000) {
+                        const firstItem = seenInviteNonces.values().next().value;
+                        seenInviteNonces.delete(firstItem);
+                    }
                     seenInviteNonces.add(nonce);
                     setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
 
@@ -2410,7 +2414,7 @@ function setupWebSocketServer(server) {
                             sendChatMessagePush(targetFcm.fcmToken, {
                                 subType: data.subType || '',
                                 targetMessageId: data.targetMessageId || '',
-                                fromUserId: callerUid,
+                                fromUserId: (currentUserId || data.fromUserId),
                                 fromName: senderName,
                                 messageId: data.messageId,
                                 text: data.text || '',
