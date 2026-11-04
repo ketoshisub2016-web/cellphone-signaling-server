@@ -1,6 +1,16 @@
+// 変更日時：2026年11月04日 05時20分
+// ============================================================================
+// GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
+// 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
+// ※ server/server.js または server/modules/*.js 変更時に自動上書き生成されます
+// ============================================================================
 const __internalModules = {};
 function __requireModule(name) { return __internalModules[name]; }
+
+// ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function (module, exports) {
+    // 変更日時：2026年11月04日 04時00分
+    // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
     const crypto = require('crypto');
     const fs = require('fs');
@@ -9,13 +19,15 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
     const SERVER_DIR = path.join(__dirname, '..');
     const DATA_DIR = path.join(SERVER_DIR, 'data');
 
+    // 許可されたGoogleアカウントのSHA-256ハッシュリスト (小文字Hex)
     const ALLOWED_EMAIL_HASHES = new Set([
-        '6838c7018bdd3e8d610196e5eeead1841bbba1f577d1a241aca19a0517edd5ac', 
-        '64ade2628e31414cfd703856b95d20762039f9eb7a252bd4f82ad30654f827c0', 
-        'cc62be47a00bd185613ae382f18ff5e162a525d01a36b72032e1efa086000597', 
-        '410e4631c35534c6c02708636b43e7b9313c262d866d01815632996faab9cccb'  
+        '6838c7018bdd3e8d610196e5eeead1841bbba1f577d1a241aca19a0517edd5ac', // satochan...
+        '64ade2628e31414cfd703856b95d20762039f9eb7a252bd4f82ad30654f827c0', // ketoshi...
+        'cc62be47a00bd185613ae382f18ff5e162a525d01a36b72032e1efa086000597', // tutuzi...
+        '410e4631c35534c6c02708636b43e7b9313c262d866d01815632996faab9cccb'  // zhouqingshui157@gmail.com
     ]);
 
+    // 相互承認ルーティングマップ (ログイン試行者 -> ワンタイム承認コード送信先)
     const APPROVAL_ROUTING = {
         'satochan.07620@gmail.com': 'ketoshisub.2016@gmail.com',
         'ketoshisub.2016@gmail.com': 'satochan.07620@gmail.com',
@@ -23,8 +35,10 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
         'zhouqingshui157@gmail.com': 'satochan.07620@gmail.com'
     };
 
+    // 3日間 (72時間) スライディング有効期限定数
     const SESSION_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
 
+    // 永続化ファイルパス
     const SECRET_KEY_FILE = path.join(DATA_DIR, 'hmac_secret.key');
     const REVOKED_TOKENS_FILE = path.join(DATA_DIR, 'revoked_tokens.json');
     const SESSIONS_FILE = path.join(SERVER_DIR, 'sessions.json');
@@ -32,12 +46,18 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
     const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
     const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
     const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
+
+    // 永続的クラスタシークレット (Render等の揮発性コンテナでも再起動・更新ごとにセッション鍵が無効化しないよう永続保証)
+    // CLUSTER_STABLE_HMAC_SECRET ハードコード廃止 (VULN-119是正)
+
+    // VULN-61 & VULN-79是正: 環境変数優先、ファイル保持、クラスタ永続キーによる多重セッション永続化
     function loadOrCreateServerHmacSecret() {
         const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
         if (envSecret.length >= 32) {
             console.log('[Security] 環境変数 SESSION_HMAC_SECRET からHMACキーを設定しました');
             return envSecret;
         }
+
         try {
             if (!fs.existsSync(DATA_DIR)) {
                 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -49,6 +69,7 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
                     return savedKey;
                 }
             }
+
             const generatedKey = crypto.randomBytes(32).toString('hex');
             fs.writeFileSync(SECRET_KEY_FILE, generatedKey, { mode: 0o600 });
             console.log('[Security] 新規ランダムHMAC署名キーを生成・保存しました');
@@ -59,8 +80,11 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
             return crypto.randomBytes(32).toString('hex');
         }
     }
+
     const SERVER_HMAC_SECRET = loadOrCreateServerHmacSecret();
     const STATE_ENC_KEY = crypto.createHash('sha256').update(`STATE_AES_GCM:${SERVER_HMAC_SECRET}`).digest();
+
+    // 各種インメモリストア
     const fcmTokenStore = new Map();
     const ipConnectionTracker = new Map();
     const otpStore = new Map();
@@ -105,6 +129,8 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
     const rooms = new Map();
     const users = new Map();
     const wsIpConnectionCount = new Map();
+
+    // Mapの最大エントリ数上限保護 (メモリ枯渇DoS防止: No.16対策)
     function enforceMapSizeCap(map, maxEntries = 5000) {
         while (map.size > maxEntries) {
             const oldestKey = map.keys().next().value;
@@ -112,6 +138,8 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
             map.delete(oldestKey);
         }
     }
+
+    // 永続化ファイル用AES-256-GCM暗号化・復号ヘルパー (No.16対策)
     function writeEncryptedJsonFile(filePath, obj) {
         try {
             const dir = path.dirname(filePath);
@@ -130,6 +158,7 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
             console.error(`[Encrypted Store] 保存エラー (${path.basename(filePath)}):`, e.message);
         }
     }
+
     function readEncryptedJsonFile(filePath) {
         if (!fs.existsSync(filePath)) { return null; }
         const raw = fs.readFileSync(filePath, 'utf8').trim();
@@ -147,6 +176,8 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
         }
         return JSON.parse(raw);
     }
+
+    // メールアドレスの伏字マスク
     function maskEmail(addr) {
         if (!addr || !addr.includes('@')) { return addr || ''; }
         const parts = addr.split('@');
@@ -154,6 +185,8 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
         const visible = name.length > 3 ? name.slice(0, 3) : name.slice(0, 1);
         return `${visible}***@${parts[1]}`;
     }
+
+    // 文字列のSHA-256ハッシュ算出
     function sha256(text) {
         return crypto.createHash('sha256').update(String(text || '').toLowerCase().trim()).digest('hex');
     }
@@ -180,6 +213,8 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
             console.error('[Revoked Token Store] 復元エラー:', e.message);
         }
     }
+
+    // トークン失効登録 (No.03 ゾンビセッション完全遮断)
     function revokeSessionToken(token) {
         if (!token || typeof token !== 'string') { return; }
         const exp = Date.now() + SESSION_DURATION_MS;
