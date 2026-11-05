@@ -574,6 +574,7 @@ __internalModules['./modules/stateStore'] = (function (module, exports) {
     loadFcmTokens();
     loadOfflineReads();
     loadAttachmentAcls();
+    loadProfiles();
     loadPhoneStore();
 
     setInterval(() => {
@@ -941,6 +942,7 @@ __internalModules['./modules/pushAndMail'] = (function (module, exports) {
     module.exports = {
         createMailTransporter,
         sendMailViaGas,
+        sendSmsViaTwilio,
         sendIncomingCallPush,
         sendChatMessagePush
     };
@@ -1421,9 +1423,11 @@ __internalModules['./modules/httpAuthRoutes'] = (function (module, exports) {
                     return true;
                 }
 
-                // 初回相互承認完了に伴い、端末情報(暗号公開鍵)を自動紐づけ登録
+                // 初回相互承認完了に伴い、端末情報(暗号公開鍵)を自動紐づけ登録 (既存電話番号フィールド等を保持)
                 if (devicePubKey) {
+                    const existingRec = phoneStore.get(email) || {};
                     phoneStore.set(email, {
+                        ...existingRec,
                         deviceUid,
                         devicePubKey,
                         linkedAt: Date.now()
@@ -1525,13 +1529,38 @@ __internalModules['./modules/httpAuthRoutes'] = (function (module, exports) {
                     return true;
                 }
 
-                // セッショントークン検証 (セッションが存在する場合は検証、存在しない場合でも署名が正当なら紐づけ許可)
-                if (sessionToken && !isValidSession(sessionToken, deviceUid, false)) {
-                    console.warn(`[Device Link] セッショントークン検証警告: 署名優先で紐づけ継続 ${email}`);
+                // VULN-229是正: 未認証の第三者による公開鍵上書き(TOFUバイパス乗っ取り)を遮断
+                let hasValidSessionForEmail = false;
+                if (sessionToken && isValidSession(sessionToken, deviceUid, false)) {
+                    const sess = activeSessions.get(sessionToken) || verifyAndRestoreStatelessToken(sessionToken);
+                    const sessEmailHash = sess ? (sess.emailHash || sha256(sess.email || "")) : "";
+                    if (sess && (!sessEmailHash || sessEmailHash === emailHash)) {
+                        hasValidSessionForEmail = true;
+                    }
                 }
 
-                // deviceStore (phoneStore) に保存
+                const existingRec = phoneStore.get(email) || {};
+                const existingCleanPub = (existingRec.devicePubKey || "").trim().replace(/\s+/g, "");
+                const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, "");
+                const isSameRegisteredDevice = Boolean(
+                    existingCleanPub &&
+                    existingCleanPub === incomingCleanPub &&
+                    existingRec.deviceUid === deviceUid
+                );
+
+                if (!hasValidSessionForEmail && !isSameRegisteredDevice) {
+                    console.warn(`[Security Block] 未認証または別アカウントによる端末公開鍵の上書き試行を遮断: ${email} (UID: ${deviceUid})`);
+                    res.writeHead(403, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        success: false,
+                        error: "端末鍵の新規登録または変更には有効なログインセッションが必要です。一度ログインしてから実行してください"
+                    }));
+                    return true;
+                }
+
+                // deviceStore (phoneStore) に既存フィールドを保持して保存
                 phoneStore.set(email, {
+                    ...existingRec,
                     deviceUid,
                     devicePubKey,
                     linkedAt: Date.now()
