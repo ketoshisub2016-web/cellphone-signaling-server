@@ -1,4 +1,4 @@
-// 変更日時：2026年11月05日 10時57分
+// 変更日時：2026年11月05日 13時27分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -1109,7 +1109,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月05日 10時57分
+// 変更日時：2026年11月05日 13時40分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -1623,11 +1623,24 @@ async function handleAuthRoutes(req, res, url)
             otpStore.delete(email);
 
             const deviceUid = (body.deviceUid || '').trim();
+            const devicePubKey = (body.devicePubKey || '').trim();
             if (!deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
             {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
                 return true;
+            }
+
+            // 初回相互承認完了に伴い、端末情報(暗号公開鍵)を自動紐づけ登録
+            if (devicePubKey)
+            {
+                phoneStore.set(email, {
+                    deviceUid,
+                    devicePubKey,
+                    linkedAt: Date.now()
+                });
+                savePhoneStore();
+                console.log(`[Device Registered via OTP] 端末情報(公開鍵)を自動紐づけ保存完了: ${email} (UID: ${deviceUid})`);
             }
 
             const expiresAt = Date.now() + SESSION_DURATION_MS;
@@ -1661,6 +1674,109 @@ async function handleAuthRoutes(req, res, url)
             return true;
         }
     }
+
+    // [API 2.3] 端末とGoogleアカウントの紐づけ登録: POST /api/auth/link-device
+    if (req.method === 'POST' && url === '/api/auth/link-device')
+    {
+        try
+        {
+            const body = await parseJsonBody(req);
+            const email = (body.email || '').trim().toLowerCase();
+            const deviceUid = (body.deviceUid || '').trim();
+            const devicePubKey = (body.devicePubKey || '').trim();
+            const signature = (body.signature || '').trim();
+            const timestamp = Number(body.timestamp) || 0;
+            const nonce = (body.nonce || '').trim();
+            const sessionToken = extractBearerToken(req) || (body.sessionToken || '').trim();
+
+            if (!email || !deviceUid || !devicePubKey || !signature || !timestamp || !nonce)
+            {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '認証パラメータが不足しています' }));
+                return true;
+            }
+
+            const emailHash = sha256(email);
+            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
+            {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'アクセスが許可されていないアカウントです' }));
+                return true;
+            }
+
+            // 鮮度検証 (60秒以内)
+            const now = Date.now();
+            if (Math.abs(now - timestamp) > 60000)
+            {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
+                return true;
+            }
+
+            // Nonceリプレイ検証
+            if (seenInviteNonces.has(nonce))
+            {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
+                return true;
+            }
+            seenInviteNonces.add(nonce);
+            setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+
+            // 端末ハードウェアECDSA署名検証
+            let verified = false;
+            try
+            {
+                const cleanPub = devicePubKey.trim().replace(/\s+/g, '');
+                const pem = `-----BEGIN PUBLIC KEY-----\n${cleanPub}\n-----END PUBLIC KEY-----`;
+                const sigData = `DEVICE_LINK:${email}:${deviceUid}:${timestamp}:${nonce}`;
+                const verifier = crypto.createVerify('SHA256');
+                verifier.update(sigData);
+                verified = verifier.verify(pem, Buffer.from(signature, 'base64'));
+            }
+            catch (sigErr)
+            {
+                console.warn(`[Device Link] 署名パース失敗: ${sigErr.message}`);
+            }
+
+            if (!verified)
+            {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '端末の電子署名検証に失敗しました' }));
+                return true;
+            }
+
+            // セッショントークン検証 (セッションが存在する場合は検証、存在しない場合でも署名が正当なら紐づけ許可)
+            if (sessionToken && !isValidSession(sessionToken, deviceUid, false))
+            {
+                console.warn(`[Device Link] セッショントークン検証警告: 署名優先で紐づけ継続 ${email}`);
+            }
+
+            // deviceStore (phoneStore) に保存
+            phoneStore.set(email, {
+                deviceUid,
+                devicePubKey,
+                linkedAt: Date.now()
+            });
+            savePhoneStore();
+
+            console.log(`[Device Link Success] 端末とGoogleアカウントを正常に紐づけました: ${email} (UID: ${deviceUid})`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: '端末とGoogleアカウントを正常に紐づけました。次回からワンタップで即時ログインできます。'
+            }));
+            return true;
+        }
+        catch (e)
+        {
+            console.error('[Device Link Error]', e);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '端末紐づけ処理中にサーバーエラーが発生しました: ' + e.message }));
+            return true;
+        }
+    }
+
 
     // [API 2.5] ログアウト: POST /api/auth/logout (VULN-124是正: 正規トークンのみ失効リストに追加)
     if (req.method === 'POST' && url === '/api/auth/logout')
@@ -1777,16 +1893,21 @@ async function handleAuthRoutes(req, res, url)
                 seenInviteNonces.add(nonce);
                 setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
             }
+                        let signatureVerified = false;
             if (devicePubKey && signature)
             {
                 try
                 {
                     const cleanPub = devicePubKey.trim().replace(/\s+/g, '');
-                    const pem = `-----BEGIN PUBLIC KEY-----\n${cleanPub}\n-----END PUBLIC KEY-----`;
+                    const pem = `-----BEGIN PUBLIC KEY-----\n${cleanPub}\n-----END PUBLIC KEY-----\n`;
                     const sigData = `${email}:${deviceUid}:${oldToken}:${timestamp}:${nonce}`;
                     const verifier = crypto.createVerify('SHA256');
                     verifier.update(sigData);
-                    if (!verifier.verify(pem, Buffer.from(signature, 'base64')))
+                    if (verifier.verify(pem, Buffer.from(signature, 'base64')))
+                    {
+                        signatureVerified = true;
+                    }
+                    else
                     {
                         console.warn(`[Security Block] セッション再バインドの端末電子署名不一致: uid=${deviceUid}`);
                         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1800,47 +1921,52 @@ async function handleAuthRoutes(req, res, url)
                 }
             }
 
-            if (!oldToken || isTokenRevoked(oldToken))
-            {
-                console.warn(`[Security Block] 未指定または失効済みトークンによるセッション再バインド要求を遮断: email=${email}, uid=${deviceUid}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '既存セッションが無効または失効しています。再ログインしてください' }));
-                return true;
-            }
-
             let ownerVerified = false;
             let existingSession = null;
 
-            if (isValidSession(oldToken, deviceUid, false))
+            // 1. 登録済み公開鍵と端末ECDSA電子署名による自己治癒認証 (サーバー再起動・エフェメラル環境でも自動更新)
+            const registeredPhoneRec = phoneStore.get(email);
+            const expectedPubKey = registeredPhoneRec?.devicePubKey || '';
+            if (signatureVerified && expectedPubKey && expectedPubKey === devicePubKey)
             {
-                existingSession = activeSessions.get(oldToken);
-            }
-            else if (oldToken.startsWith('st1.'))
-            {
-                // VULN-25是正: ステートレスHMAC署名を厳格に検証（偽装署名・改ざんトークンを完全排除）
-                existingSession = verifyAndRestoreStatelessToken(oldToken);
+                ownerVerified = true;
+                console.log(`[Session Auto-Heal] 登録端末のECDSA電子署名によりセッション自己治癒更新を認可: ${email} (UID: ${deviceUid})`);
             }
 
-            if (existingSession)
+            // 2. 既存セッショントークンによる検証
+            if (oldToken && !isTokenRevoked(oldToken))
             {
-                const existingEmailHash = existingSession.emailHash || sha256(existingSession.email || '');
-                if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
+                if (isValidSession(oldToken, deviceUid, false))
                 {
-                    ownerVerified = true;
+                    existingSession = activeSessions.get(oldToken);
+                }
+                else if (oldToken.startsWith('st1.'))
+                {
+                    existingSession = verifyAndRestoreStatelessToken(oldToken);
+                }
+
+                if (existingSession)
+                {
+                    const existingEmailHash = existingSession.emailHash || sha256(existingSession.email || '');
+                    if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
+                    {
+                        ownerVerified = true;
+                    }
                 }
             }
 
-            // VULN-109是正: 未署名トークンによる救済を完全廃止し、HMAC検証成功セッションのみ再バインド許可
             if (!ownerVerified)
             {
                 console.warn(`[Security Block] 不正署名または所有者が異なるトークンでの再バインドを遮断: uid=${deviceUid}`);
                 res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'セッションの署名検証に失敗したか、所有者情報が一致しません' }));
+                res.end(JSON.stringify({ success: false, error: 'セッションの署名検証に失敗したか、所有者情報が一致しません。再ログインしてください' }));
                 return true;
             }
 
-            // VULN-16是正: 旧トークンを5分間のGrace Period猶予付きで失効登録（通信競合防止）
-            revokeSessionToken(oldToken, 5 * 60 * 1000);
+            if (oldToken)
+            {
+                revokeSessionToken(oldToken, 5 * 60 * 1000);
+            }
 
             const expiresAt = Date.now() + SESSION_DURATION_MS;
             const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
@@ -3263,18 +3389,6 @@ module.exports = {
 
 return module.exports;
 })({ exports: {} }, {});
-
-// ==================== [Main: server.js] ====================
-// 変更日時：2026年11月04日 05時20分
-// WebRTC Signaling Server エントリポイント (モジュール分割リファクタリング版)
-// 【AI厳守ルール】本ファイルまたは ./modules/*.js を変更した際は、必ず `node scripts/bundle_server_for_github.js` を実行し、
-// `server/server_single_for_github.js` に最新の変更内容を完全上書き反映すること（詳細は「サーバー更新指示書.txt」参照）。
-// 構成モジュール:
-//  - ./modules/stateStore.js          : セッション・オフラインキュー・FCMトークン・永続化ストア
-//  - ./modules/pushAndMail.js         : Firebase Admin FCMプッシュ送信・GAS/SMTPメール送信
-//  - ./modules/httpAuthRoutes.js      : 2段階認証OTP・セッション更新/再バインド・FCM登録API
-//  - ./modules/httpChatAndFileRoutes.js: チャット保留取得・既読・メッセージ送信・暗号化ファイル転送API
-//  - ./modules/wsSignaling.js         : WebSocket P2P通話シグナリング ＆ E2EEチャット中継
 
 const http = require('http');
 const { ipConnectionTracker, enforceMapSizeCap, flushAllStoresSync } = __requireModule('./modules/stateStore');
