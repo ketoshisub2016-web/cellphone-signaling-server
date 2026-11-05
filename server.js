@@ -1,4 +1,4 @@
-// 変更日時：2026年11月05日 01時02分
+// 変更日時：2026年11月05日 10時47分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月05日 00時41分
+// 変更日時：2026年11月05日 10時46分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -766,7 +766,9 @@ module.exports = {
     saveProfiles,
     loadProfiles,
     phoneStore,
+    deviceStore: phoneStore,
     savePhoneStore,
+    saveDeviceStore: savePhoneStore,
     loadPhoneStore,
     parseJsonBody,
     flushAllStoresSync
@@ -1107,7 +1109,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月05日 00時41分
+// 変更日時：2026年11月05日 10時46分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -1496,7 +1498,7 @@ async function handleAuthRoutes(req, res, url)
                 res.writeHead(403, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     success: false,
-                    error: '本端末の暗号鍵はサーバーに事前登録されていません。初回はGoogleアカウントおよび承認コードでログインしてください。'
+                    error: '本端末の情報はサーバーに事前登録されていません。初回はGoogleアカウントでログインしてください（次回から端末情報でログインできます）。'
                 }));
                 return true;
             }
