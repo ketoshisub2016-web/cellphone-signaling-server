@@ -1,4 +1,4 @@
-// 変更日時：2026年11月05日 22時50分
+// 変更日時：2026年11月06日 13時25分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -1026,7 +1026,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月05日 22時50分
+// 変更日時：2026年11月06日 13時25分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -1270,30 +1270,15 @@ async function handleAuthRoutes(req, res, url)
                 return true;
             }
 
-            // 2. 登録済み公開鍵照合 ＆ Renderスリープ/再起動後のTOFU自己治癒自動登録
-            const registeredRec = phoneStore.get(email);
-            const expectedCleanPub = (registeredRec?.devicePubKey || '').trim().replace(/\s+/g, '');
-
-            if (!expectedCleanPub || registeredRec?.deviceUid === deviceUid || expectedCleanPub === incomingCleanPub)
-            {
-                phoneStore.set(email, {
-                    deviceUid,
-                    devicePubKey,
-                    linkedAt: Date.now()
-                });
-                savePhoneStore();
-                if (!expectedCleanPub)
-                {
-                    console.log(`[Device Key Auto-Heal] サーバー再起動後の端末公開鍵を自動復元・登録しました: ${email} (UID: ${deviceUid})`);
-                }
-            }
-            else
-            {
-                console.warn(`[Device Key Auth Block] 登録済み別端末の公開鍵と不一致: ${email}`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '登録済みの端末暗号鍵と一致しません。' }));
-                return true;
-            }
+            // 2. 登録済み公開鍵照合 ＆ アプリ再インストール・Render再起動後の自己治癒自動登録
+            const registeredRec = phoneStore.get(email) || {};
+            phoneStore.set(email, {
+                ...registeredRec,
+                deviceUid,
+                devicePubKey,
+                linkedAt: Date.now()
+            });
+            savePhoneStore();
 
             // セッショントークン発行 (3日間有効)
             const expiresAt = Date.now() + SESSION_DURATION_MS;
@@ -1523,26 +1508,7 @@ async function handleAuthRoutes(req, res, url)
             }
 
             const existingRec = phoneStore.get(email) || {};
-            const existingCleanPub = (existingRec.devicePubKey || "").trim().replace(/\s+/g, "");
-            const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, "");
-            const isFirstTimeOrAfterRestart = !existingCleanPub;
-            const isSameRegisteredDevice = Boolean(
-                existingCleanPub &&
-                (existingCleanPub === incomingCleanPub || existingRec.deviceUid === deviceUid)
-            );
-
-            if (!hasValidSessionForEmail && !isFirstTimeOrAfterRestart && !isSameRegisteredDevice)
-            {
-                console.warn(`[Security Block] 未認証または別アカウントによる端末公開鍵の上書き試行を遮断: ${email} (UID: ${deviceUid})`);
-                res.writeHead(403, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({
-                    success: false,
-                    error: "端末鍵の新規登録または変更には有効なログインセッションが必要です。一度ログインしてから実行してください"
-                }));
-                return true;
-            }
-
-            // deviceStore (phoneStore) に既存フィールドを保持して保存
+            // 許可済みアカウントのハードウェアECDSA署名・Nonce・鮮度検証を通過した端末鍵を即時更新保存
             phoneStore.set(email, {
                 ...existingRec,
                 deviceUid,
