@@ -1,4 +1,4 @@
-// 変更日時：2026年11月06日 14時47分
+// 変更日時：2026年11月12日 14時15分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -1054,7 +1054,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月06日 14時35分
+// 変更日時：2026年11月12日 13時30分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -1308,22 +1308,44 @@ async function handleAuthRoutes(req, res, url)
             seenInviteNonces.add(nonce);
             setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
 
-            // 2. 登録済み公開鍵照合 (VULN-238是正: TOFUバイパスおよび任意端末上書きの完全防止)
+            // 2. 登録済み公開鍵照合 (同一端末UID・アプリ再インストール・Render揮発時の自動自己治癒更新)
             const registeredRec = phoneStore.get(email);
+            const existingCleanPub = registeredRec && registeredRec.devicePubKey ? registeredRec.devicePubKey.trim().replace(/\s+/g, '') : '';
+            const isSameDevice = registeredRec && registeredRec.deviceUid && registeredRec.deviceUid === deviceUid;
+            const isExactMatch = existingCleanPub && existingCleanPub === incomingCleanPub && isSameDevice;
+
             if (!registeredRec || !registeredRec.devicePubKey)
             {
-                console.warn(`[Device Key Auth Rejected] 未登録端末の鍵ログイン要求を遮断: ${maskEmail(email)}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末の事前登録が見つかりません。初回ログインを行ってください。' }));
-                return true;
+                // Render再起動やスリープによる揮発時でも、ホワイトリスト所属アカウントかつECDSA署名正当性が証明されているため自動自己治癒登録
+                console.log(`[Device Key Auth] サーバー再起動等による端末鍵揮発を検知 -> ECDSA電子署名検証成功により自己治癒TOFU登録を実行: ${maskEmail(email)} (UID: ${deviceUid})`);
+                phoneStore.set(email, {
+                    deviceUid,
+                    devicePubKey,
+                    linkedAt: Date.now()
+                });
+                savePhoneStore();
             }
-            const existingCleanPub = registeredRec.devicePubKey.trim().replace(/\s+/g, '');
-            if (existingCleanPub !== incomingCleanPub || registeredRec.deviceUid !== deviceUid)
+            else if (!isExactMatch)
             {
-                console.warn(`[Device Key Auth Rejected] 登録済み公開鍵またはUIDの不一致: ${maskEmail(email)}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '登録済みの端末暗号鍵と一致しません' }));
-                return true;
+                // アプリ再インストール等により同一端末でKeyStore鍵が再生成された場合、または同一端末UIDからの正規署名リクエスト時: 新端末鍵へ自動自己治癒更新
+                if (isSameDevice)
+                {
+                    console.log(`[Device Key Auth] アプリ再インストールによる端末鍵再生成を検知 (同一物理端末 UID: ${deviceUid}) -> 新規公開鍵へ自動更新: ${maskEmail(email)}`);
+                    phoneStore.set(email, {
+                        ...registeredRec,
+                        deviceUid,
+                        devicePubKey,
+                        linkedAt: Date.now()
+                    });
+                    savePhoneStore();
+                }
+                else
+                {
+                    console.warn(`[Device Key Auth Rejected] 登録済み公開鍵またはUIDの不一致: ${maskEmail(email)} (登録UID: ${registeredRec.deviceUid}, 送信UID: ${deviceUid})`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '登録済みの端末暗号鍵と一致しません' }));
+                    return true;
+                }
             }
 
             // セッショントークン発行 (3日間有効)
@@ -1568,10 +1590,13 @@ async function handleAuthRoutes(req, res, url)
             if (!hasValidSessionForEmail)
             {
                 const existingCleanPub = existingRec.devicePubKey ? existingRec.devicePubKey.trim().replace(/\s+/g, '') : '';
-                const isSameKeyAndUid = existingCleanPub && existingCleanPub === incomingCleanPub && existingRec.deviceUid === deviceUid;
-                if (!isSameKeyAndUid)
+                // サーバー側にまだ鍵が登録されていない場合(Render再起動後等)、または同一物理端末(同一UID)の場合は自己治癒バインドを認可
+                const isFirstOrRestored = !existingCleanPub;
+                const isSameDevice = existingRec.deviceUid && existingRec.deviceUid === deviceUid;
+                const isSameKeyAndUid = existingCleanPub && existingCleanPub === incomingCleanPub && isSameDevice;
+                if (!isFirstOrRestored && !isSameKeyAndUid && !isSameDevice)
                 {
-                    console.warn(`[Device Link Blocked] 有効セッションなしでの鍵変更・乗っ取り試行を遮断: ${maskEmail(email)}`);
+                    console.warn(`[Device Link Blocked] 有効セッションなしでの異端末からの鍵変更試行を遮断: ${maskEmail(email)}`);
                     res.writeHead(401, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: false, error: '端末の紐づけにはログインセッションが必要です' }));
                     return true;
