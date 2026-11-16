@@ -1,4 +1,4 @@
-// 変更日時：2026年11月16日 15時56分
+// 変更日時：2026年11月16日 17時24分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月16日 15時55分
+// 変更日時：2026年11月16日 17時24分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -1127,6 +1127,66 @@ function enqueueOfflineRead(fromUserId, targetUserId, messageIds)
     return { queued: true, size: rq.length };
 }
 
+// 同一暗号文パケット重複排除キー生成 (WS/HTTP同時送信は排除しつつ再暗号化リトライは通す)
+function buildChatDedupKey(fromUserId, targetUserId, data)
+{
+    if (!data || !data.messageId) { return ''; }
+    const ivPart = typeof data.iv === 'string' && data.iv
+        ? crypto.createHash('sha1').update(data.iv).digest('hex').slice(0, 12)
+        : '';
+    return ivPart ? `${fromUserId}:${targetUserId}:${data.messageId}:${ivPart}` : `${fromUserId}:${targetUserId}:${data.messageId}`;
+}
+
+// オフラインキュー追加・置換共通ヘルパー (再送時は旧暗号文を新暗号文で差し替え)
+function upsertOfflineChatPacket(targetUserId, packet, logPrefix = 'Chat Queue')
+{
+    if (!offlineMessageQueue.has(targetUserId))
+    {
+        enforceMapSizeCap(offlineMessageQueue, 500);
+        offlineMessageQueue.set(targetUserId, []);
+    }
+    const queue = offlineMessageQueue.get(targetUserId);
+    if (packet.subType === 'unsend' && packet.targetMessageId)
+    {
+        for (let i = queue.length - 1; i >= 0; i--)
+        {
+            if ((queue[i].messageId === packet.targetMessageId || queue[i].targetMessageId === packet.targetMessageId) && queue[i].fromUserId === packet.fromUserId)
+            {
+                queue.splice(i, 1);
+            }
+        }
+    }
+    else if (packet.subType === 'edit' && packet.targetMessageId)
+    {
+        for (let i = queue.length - 1; i >= 0; i--)
+        {
+            if (queue[i].subType === 'edit' && queue[i].targetMessageId === packet.targetMessageId && queue[i].fromUserId === packet.fromUserId)
+            {
+                queue.splice(i, 1);
+            }
+        }
+    }
+
+    const existingIdx = packet.messageId ? queue.findIndex(m => m.messageId && m.messageId === packet.messageId) : -1;
+    if (existingIdx >= 0)
+    {
+        if (queue[existingIdx].iv !== packet.iv || queue[existingIdx].cipher !== packet.cipher)
+        {
+            queue[existingIdx] = packet;
+            saveOfflineQueue();
+        }
+        return;
+    }
+    if (queue.length >= 100)
+    {
+        console.warn(`[${logPrefix} Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
+        return;
+    }
+    queue.push(packet);
+    saveOfflineQueue();
+    console.log(`[${logPrefix}] 相手(${targetUserId})宛てキュー保管完了 (subType=${packet.subType || 'normal'}, 保留計: ${queue.length}件)`);
+}
+
 // チャット送信レートリミット共通判定 (HTTP/WS共通でUID毎最大30件/秒)
 function isChatSendRateLimited(fromUserId)
 {
@@ -1303,6 +1363,8 @@ module.exports = {
     saveFcmTokens,
     saveOfflineReads,
     enqueueOfflineRead,
+    buildChatDedupKey,
+    upsertOfflineChatPacket,
     isChatSendRateLimited,
     saveAttachmentAcls,
     profileStore,
@@ -1333,7 +1395,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/pushAndMail.js] ====================
 __internalModules['./modules/pushAndMail'] = (function(module, exports) {
-// 変更日時：2026年11月05日 22時50分
+// 変更日時：2026年11月16日 17時24分
 // [サーバーモジュール] Firebase Admin FCMプッシュ送信 ＆ OTP認証メール送信 (GAS / SMTP)
 
 const https = require('https');
@@ -1517,7 +1579,46 @@ async function sendIncomingCallPush(targetFcmToken, callData)
     }
 }
 
-// FCM新着チャットプッシュ送信 (dataメッセージ統一・暗号化本文＆添付ファイル情報を完全伝送)
+// FCMチャット送信用の共通ペイロード構築ヘルパー (HTTP/WS共通・PFSメタ情報伝送)
+function buildChatFcmPayload(senderName, fromUserId, data)
+{
+    return {
+        subType: data.subType || '',
+        targetMessageId: data.targetMessageId || '',
+        fromUserId: fromUserId,
+        fromName: senderName || '友だち',
+        messageId: data.messageId || '',
+        text: data.text || '',
+        iv: data.iv || '',
+        cipher: data.cipher || '',
+        // VULN-50是正: FCM 4KBペイロード制限超過を防ぐため生画像Base64を除外
+        hasImage: data.imageBase64 ? 'true' : '',
+        fileUrl: data.fileUrl || '',
+        fileKey: '',
+        fileName: data.fileName || '',
+        fileSize: data.fileSize || '0',
+        senderPubKey: data.senderPubKey || '',
+        senderPubSig: data.senderPubSig || '',
+        pfsCapable: (data.pfsCapable === true || data.pfsCapable === 'true') ? 'true' : '',
+        pfsCapSig: data.pfsCapSig || '',
+        pfsVer: data.pfsVer ? String(data.pfsVer) : '',
+        ephemPub: data.ephemPub || '',
+        ephemSig: data.ephemSig || '',
+        timestamp: data.timestamp || Date.now()
+    };
+}
+
+function estimateFcmDataBytes(dataMap)
+{
+    let total = 0;
+    for (const [k, v] of Object.entries(dataMap))
+    {
+        total += Buffer.byteLength(k, 'utf8') + Buffer.byteLength(String(v), 'utf8');
+    }
+    return total;
+}
+
+// FCM新着チャットプッシュ送信 (dataメッセージ統一・暗号化本文＆PFS情報を完全伝送)
 async function sendChatMessagePush(targetFcmToken, chatData)
 {
     if (!firebaseApp || !admin)
@@ -1532,30 +1633,48 @@ async function sendChatMessagePush(targetFcmToken, chatData)
     }
     try
     {
+        const dataPayload = {
+            type: 'chat_message',
+            subType: String(chatData.subType || ''),
+            targetMessageId: String(chatData.targetMessageId || ''),
+            fromUserId: String(chatData.fromUserId || ''),
+            fromName: String(chatData.fromName || '友だち'),
+            messageId: String(chatData.messageId || ''),
+            text: String(chatData.text || ''),
+            iv: String(chatData.iv || ''),
+            cipher: String(chatData.cipher || ''),
+            // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
+            hasImage: String(chatData.hasImage === 'true' || !!chatData.imageBase64 ? 'true' : 'false'),
+            fileUrl: String(chatData.fileUrl || ''),
+            // VULN-21是正: 添付ファイル復号鍵(fileKey)を平文プッシュ伝送から完全排除（E2EEペイロード内のみで安全に伝送）
+            fileKey: '',
+            fileName: String(chatData.fileName || ''),
+            fileSize: String(chatData.fileSize || '0'),
+            senderPubKey: String(chatData.senderPubKey || ''),
+            // VULN-24是正: 電子署名(senderPubSig)を正しく伝送し、FCMプッシュ経由での鍵検証を可能にする
+            senderPubSig: String(chatData.senderPubSig || ''),
+            pfsCapable: String(chatData.pfsCapable || ''),
+            pfsCapSig: String(chatData.pfsCapSig || ''),
+            pfsVer: String(chatData.pfsVer || ''),
+            ephemPub: String(chatData.ephemPub || ''),
+            ephemSig: String(chatData.ephemSig || ''),
+            timestamp: String(chatData.timestamp || Date.now())
+        };
+
+        // 画像インライン暗号文等でFCM 4KB制限を超える場合はトリガ通知のみ送り、本体はPULL同期で取得させる
+        if (estimateFcmDataBytes(dataPayload) > 3400)
+        {
+            dataPayload.cipher = '';
+            dataPayload.iv = '';
+            dataPayload.pfsVer = '';
+            dataPayload.ephemPub = '';
+            dataPayload.ephemSig = '';
+            dataPayload.truncatedForSync = 'true';
+        }
+
         const message = {
             token: targetFcmToken,
-            data: {
-                type: 'chat_message',
-                subType: String(chatData.subType || ''),
-                targetMessageId: String(chatData.targetMessageId || ''),
-                fromUserId: String(chatData.fromUserId || ''),
-                fromName: String(chatData.fromName || '友だち'),
-                messageId: String(chatData.messageId || ''),
-                text: String(chatData.text || ''),
-                iv: String(chatData.iv || ''),
-                cipher: String(chatData.cipher || ''),
-                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
-                hasImage: String(chatData.hasImage === 'true' || !!chatData.imageBase64 ? 'true' : 'false'),
-                fileUrl: String(chatData.fileUrl || ''),
-                // VULN-21是正: 添付ファイル復号鍵(fileKey)を平文プッシュ伝送から完全排除（E2EEペイロード内のみで安全に伝送）
-                fileKey: '',
-                fileName: String(chatData.fileName || ''),
-                fileSize: String(chatData.fileSize || '0'),
-                senderPubKey: String(chatData.senderPubKey || ''),
-                // VULN-24是正: 電子署名(senderPubSig)を正しく伝送し、FCMプッシュ経由での鍵検証を可能にする
-                senderPubSig: String(chatData.senderPubSig || ''),
-                timestamp: String(chatData.timestamp || Date.now())
-            },
+            data: dataPayload,
             android: {
                 priority: 'high',
                 ttl: 7 * 24 * 60 * 60 * 1000
@@ -1577,7 +1696,8 @@ module.exports = {
     createMailTransporter,
     sendMailViaGas,
     sendIncomingCallPush,
-    sendChatMessagePush
+    sendChatMessagePush,
+    buildChatFcmPayload
 };
 
 return module.exports;
@@ -3300,7 +3420,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月16日 12時46分
+// 変更日時：2026年11月16日 17時24分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const backupRateLimitMap = new Map(); // userId -> lastBackupTime
@@ -3328,6 +3448,8 @@ const {
     saveOfflineQueue,
     saveOfflineReads,
     enqueueOfflineRead,
+    buildChatDedupKey,
+    upsertOfflineChatPacket,
     isChatSendRateLimited,
     saveAttachmentAcls,
     profileStore,
@@ -3337,7 +3459,7 @@ const {
     supabaseServiceSelect,
     parseJsonBody
 } = __requireModule('./modules/stateStore');
-const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
+const { sendChatMessagePush, buildChatFcmPayload } = __requireModule('./modules/pushAndMail');
 
 const UPLOAD_DIR = path.join(SERVER_DIR, 'uploads');
 
@@ -3535,9 +3657,35 @@ async function handleChatAndFileRoutes(req, res, url) {
             const token = extractBearerToken(req) || (data.token || '').trim();
 
             // VULN-244是正: パケットtypeの厳格なホワイトリスト検証
-            if (!['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(pktType)) {
+            if (!['chat_message', 'chat_key_ping', 'chat_key_pong', 'chat_decrypt_error'].includes(pktType)) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '不正なメッセージタイプです' }));
+                return true;
+            }
+
+            if (pktType === 'chat_decrypt_error') {
+                if (!fromUserId || !targetUserId || !data.messageId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
+                    return true;
+                }
+                if (!token || !isValidSession(token, fromUserId)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
+                const targetEntryErr = users.get(targetUserId);
+                if (targetEntryErr && targetEntryErr.ws.readyState === WebSocket.OPEN) {
+                    targetEntryErr.ws.send(JSON.stringify({
+                        type: 'chat_decrypt_error',
+                        fromUserId: fromUserId,
+                        targetUserId: targetUserId,
+                        messageId: String(data.messageId || '').slice(0, 128),
+                        timestamp: Date.now()
+                    }));
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ success: true }));
                 return true;
             }
 
@@ -3575,14 +3723,14 @@ async function handleChatAndFileRoutes(req, res, url) {
             const targetEntry = users.get(targetUserId);
             const senderName = users.get(fromUserId)?.name || '友だち';
             const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
-            const dedupKey = data.messageId ? `${fromUserId}:${targetUserId}:${data.messageId}` : '';
+            const dedupKey = buildChatDedupKey(fromUserId, targetUserId, data);
             const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
             if (dedupKey) {
                 enforceMapSizeCap(recentChatPacketIds, 5000);
                 recentChatPacketIds.set(dedupKey, Date.now());
             }
 
-            // VULN-244 & VULN-251是正: クライアント入力の未検証プロパティを除外し、安全なパケットのみ再構築
+            // VULN-244 & VULN-251是正: クライアント入力の未検証プロパティを除外し、安全なパケットのみ再構築 (PFSエフェメラル鍵・署名も確実に保持)
             const safePacket = {
                 type: pktType,
                 fromUserId: fromUserId,
@@ -3598,6 +3746,11 @@ async function handleChatAndFileRoutes(req, res, url) {
                 senderPubSig: typeof data.senderPubSig === 'string' ? data.senderPubSig.slice(0, 512) : '',
                 timestamp: Number(data.timestamp) || Date.now()
             };
+            if (data.pfsCapable === true || data.pfsCapable === 'true') { safePacket.pfsCapable = true; }
+            if (typeof data.pfsCapSig === 'string' && data.pfsCapSig) { safePacket.pfsCapSig = data.pfsCapSig.slice(0, 512); }
+            if (data.pfsVer) { safePacket.pfsVer = Number(data.pfsVer) || 2; }
+            if (typeof data.ephemPub === 'string' && data.ephemPub) { safePacket.ephemPub = data.ephemPub.slice(0, 512); }
+            if (typeof data.ephemSig === 'string' && data.ephemSig) { safePacket.ephemSig = data.ephemSig.slice(0, 512); }
             if (data.imageBase64 && typeof data.imageBase64 === 'string' && data.imageBase64.length <= 512 * 1024) {
                 safePacket.imageBase64 = data.imageBase64;
             }
@@ -3618,57 +3771,12 @@ async function handleChatAndFileRoutes(req, res, url) {
 
             // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
             if (!sentViaWs || isMutation) {
-                if (!offlineMessageQueue.has(targetUserId)) {
-                    enforceMapSizeCap(offlineMessageQueue, 500);
-                    offlineMessageQueue.set(targetUserId, []);
-                }
-                const queue = offlineMessageQueue.get(targetUserId);
-                if (data.subType === 'unsend' && data.targetMessageId) {
-                    for (let i = queue.length - 1; i >= 0; i--) {
-                        if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === fromUserId) {
-                            queue.splice(i, 1);
-                        }
-                    }
-                }
-                else if (data.subType === 'edit' && data.targetMessageId) {
-                    for (let i = queue.length - 1; i >= 0; i--) {
-                        if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === fromUserId) {
-                            queue.splice(i, 1);
-                        }
-                    }
-                }
-                if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
-                    if (queue.length >= 100) {
-                        console.warn(`[HTTP Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
-                    } else {
-                        queue.push(safePacket);
-                        saveOfflineQueue();
-                        console.log(`[HTTP Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
-                    }
-                }
+                upsertOfflineChatPacket(targetUserId, safePacket, 'HTTP Chat Queue');
             }
 
             const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
             if (!isKeyPacket && !alreadyProcessed && targetFcm && targetFcm.fcmToken) {
-                sendChatMessagePush(targetFcm.fcmToken, {
-                    subType: data.subType || '',
-                    targetMessageId: data.targetMessageId || '',
-                    fromUserId: fromUserId,
-                    fromName: senderName,
-                    messageId: data.messageId,
-                    text: data.text || '',
-                    iv: data.iv || '',
-                    cipher: data.cipher || '',
-                    // VULN-50是正: FCM 4KBペイロード制限超過を防ぐため生画像Base64を除外
-                    hasImage: data.imageBase64 ? 'true' : '',
-                    fileUrl: data.fileUrl || '',
-                    fileKey: '',
-                    fileName: data.fileName || '',
-                    fileSize: data.fileSize || '0',
-                    senderPubKey: data.senderPubKey || '',
-                    senderPubSig: data.senderPubSig || '',
-                    timestamp: data.timestamp || Date.now()
-                });
+                sendChatMessagePush(targetFcm.fcmToken, buildChatFcmPayload(senderName, fromUserId, safePacket));
             }
 
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -4260,7 +4368,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月16日 12時47分
+// 変更日時：2026年11月16日 17時24分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -4278,9 +4386,11 @@ const {
     isValidSession,
     saveOfflineQueue,
     enqueueOfflineRead,
+    buildChatDedupKey,
+    upsertOfflineChatPacket,
     isChatSendRateLimited
 } = __requireModule('./modules/stateStore');
-const { sendIncomingCallPush, sendChatMessagePush } = __requireModule('./modules/pushAndMail');
+const { sendIncomingCallPush, sendChatMessagePush, buildChatFcmPayload } = __requireModule('./modules/pushAndMail');
 
 // 認証済みWebSocketのトークン有効・非失効検証 (SEC-05)
 function isWsSessionStillValid(ws, expectedUid)
@@ -4594,7 +4704,7 @@ function setupWebSocketServer(server) {
                     const targetEntry = users.get(targetUserId);
                     const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
                     const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
-                    const dedupKey = data.messageId ? `${data.fromUserId}:${targetUserId}:${data.messageId}` : '';
+                    const dedupKey = buildChatDedupKey(data.fromUserId, targetUserId, data);
                     const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
                     if (dedupKey) {
                         enforceMapSizeCap(recentChatPacketIds, 5000);
@@ -4612,58 +4722,13 @@ function setupWebSocketServer(server) {
 
                     // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
                     if (!sentViaWs || isMutation) {
-                        if (!offlineMessageQueue.has(targetUserId)) {
-                            enforceMapSizeCap(offlineMessageQueue, 500);
-                            offlineMessageQueue.set(targetUserId, []);
-                        }
-                        const queue = offlineMessageQueue.get(targetUserId);
-                        if (data.subType === 'unsend' && data.targetMessageId) {
-                            for (let i = queue.length - 1; i >= 0; i--) {
-                                if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === data.fromUserId) {
-                                    queue.splice(i, 1);
-                                }
-                            }
-                        }
-                        else if (data.subType === 'edit' && data.targetMessageId) {
-                            for (let i = queue.length - 1; i >= 0; i--) {
-                                if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === data.fromUserId) {
-                                    queue.splice(i, 1);
-                                }
-                            }
-                        }
-                        if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
-                            if (queue.length >= 100) {
-                                console.warn(`[E2EE Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
-                            } else {
-                                queue.push(data);
-                                saveOfflineQueue();
-                                console.log(`[E2EE Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
-                            }
-                        }
+                        upsertOfflineChatPacket(targetUserId, data, 'E2EE Chat Queue');
                     }
 
                     if (type === 'chat_message' && !alreadyProcessed) {
                         const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
                         if (targetFcm && targetFcm.fcmToken) {
-                            sendChatMessagePush(targetFcm.fcmToken, {
-                                subType: data.subType || '',
-                                targetMessageId: data.targetMessageId || '',
-                                fromUserId: (currentUserId || data.fromUserId),
-                                fromName: senderName,
-                                messageId: data.messageId,
-                                text: data.text || '',
-                                iv: data.iv || '',
-                                cipher: data.cipher || '',
-                                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
-                                hasImage: data.imageBase64 ? 'true' : '',
-                                fileUrl: data.fileUrl || '',
-                                fileKey: '',
-                                fileName: data.fileName || '',
-                                fileSize: data.fileSize || '0',
-                                senderPubKey: data.senderPubKey || '',
-                                senderPubSig: data.senderPubSig || '',
-                                timestamp: data.timestamp || Date.now()
-                            });
+                            sendChatMessagePush(targetFcm.fcmToken, buildChatFcmPayload(senderName, (currentUserId || data.fromUserId), data));
                         }
 
                         if (ws.readyState === WebSocket.OPEN) {
