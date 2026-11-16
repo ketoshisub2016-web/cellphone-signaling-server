@@ -1,4 +1,4 @@
-// 変更日時：2026年11月16日 17時24分
+// 変更日時：2026年11月16日 19時37分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -1705,7 +1705,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
 __internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月16日 12時46分
+// 変更日時：2026年11月16日 19時52分
 // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
 const crypto = require('crypto');
@@ -1846,9 +1846,64 @@ function hasValidEmailSession(sessionToken, deviceUid, emailHash)
     return Boolean(sessEmailHash && sessEmailHash === emailHash);
 }
 
+// 認証済みユーザー向けに時限TURN資格情報を安全生成 (RFC 5766 HMAC-SHA1または環境変数フォールバック)
+function buildDynamicTurnCredentials(deviceUid)
+{
+    const rawUrls = (process.env.TURN_URLS || '').trim();
+    const urls = rawUrls
+        ? rawUrls.split(',').map(s => s.trim()).filter(u => u.startsWith('turn:') || u.startsWith('turns:'))
+        : [];
+    if (urls.length === 0)
+    {
+        return { urls: [], username: '', credential: '', ttlSeconds: 0 };
+    }
+
+    const sharedSecret = (process.env.TURN_SHARED_SECRET || '').trim();
+    if (sharedSecret)
+    {
+        const ttlSeconds = 43200;
+        const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
+        const username = `${expiry}:${deviceUid}`;
+        const credential = crypto.createHmac('sha1', sharedSecret).update(username).digest('base64');
+        return { urls, username, credential, ttlSeconds };
+    }
+
+    const staticUser = (process.env.TURN_USERNAME || '').trim();
+    const staticPass = (process.env.TURN_PASSWORD || '').trim();
+    if (!staticUser || !staticPass)
+    {
+        return { urls: [], username: '', credential: '', ttlSeconds: 0 };
+    }
+    return { urls, username: staticUser, credential: staticPass, ttlSeconds: 3600 };
+}
+
 // 認証およびFCM登録系HTTPエンドポイントの処理 (処理した場合は true を返す)
 async function handleAuthRoutes(req, res, url)
 {
+    const pathname = url.split('?')[0];
+
+    // [API 0] 動的TURN資格情報取得: GET /api/turn/credentials (認証セッション必須)
+    if (req.method === 'GET' && pathname === '/api/turn/credentials')
+    {
+        const token = extractBearerToken(req);
+        const deviceUid = String(req.headers['x-device-uid'] || '').trim();
+        if (!token || !isValidUidFormat(deviceUid) || !isValidSession(token, deviceUid, false))
+        {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+            return true;
+        }
+        const turnInfo = buildDynamicTurnCredentials(deviceUid);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            success: true,
+            urls: turnInfo.urls,
+            username: turnInfo.username,
+            credential: turnInfo.credential,
+            ttlSeconds: turnInfo.ttlSeconds
+        }));
+        return true;
+    }
     // [API 1] OTP送信: POST /api/auth/send-otp
     if (req.method === 'POST' && url === '/api/auth/send-otp')
     {
@@ -4368,7 +4423,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
 __internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月16日 17時24分
+// 変更日時：2026年11月16日 19時52分
 // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
 const WebSocket = require('ws');
@@ -4503,7 +4558,7 @@ function setupWebSocketServer(server) {
                     ws.messageCountInWindow = 0;
                 }
                 ws.messageCountInWindow++;
-                if (ws.messageCountInWindow > 30) {
+                if (ws.messageCountInWindow > 60) {
                     console.warn(`[Rate Limit Exceeded] メッセージ過剰送信をドロップ: ${currentUserId || 'unknown'}`);
                     return;
                 }
