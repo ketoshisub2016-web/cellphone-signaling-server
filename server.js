@@ -1,4 +1,4 @@
-// 変更日時：2026年11月14日 19時36分
+// 変更日時：2026年11月16日 13時07分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -8,1549 +8,1443 @@ const __internalModules = {};
 function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
-__internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月14日 19時16分
-// [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
+__internalModules['./modules/stateStore'] = (function (module, exports) {
+    // 変更日時：2026年11月16日 12時45分
+    // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const path = require('path');
 
-const SERVER_DIR = path.join(__dirname, '..');
-const DATA_DIR = path.join(SERVER_DIR, 'data');
+    // 単一バンドル(server_single_for_github.js)と分割配置の両方で正しいルートを動的解決
+    const IS_MODULE_LAYOUT = path.basename(__dirname) === 'modules' && fs.existsSync(path.join(__dirname, 'stateStore.js'));
+    const SERVER_DIR = IS_MODULE_LAYOUT ? path.join(__dirname, '..') : __dirname;
+    const DATA_DIR = path.join(SERVER_DIR, 'data');
 
-// 許可されたGoogleアカウントのSHA-256ハッシュリスト (小文字Hex)
-const ALLOWED_EMAIL_HASHES = new Set([
-    '6838c7018bdd3e8d610196e5eeead1841bbba1f577d1a241aca19a0517edd5ac', // satochan...
-    '64ade2628e31414cfd703856b95d20762039f9eb7a252bd4f82ad30654f827c0', // ketoshi...
-    'cc62be47a00bd185613ae382f18ff5e162a525d01a36b72032e1efa086000597', // tutuzi...
-    '410e4631c35534c6c02708636b43e7b9313c262d866d01815632996faab9cccb'  // zhouqingshui157@gmail.com
-]);
-
-// 相互承認ルーティングマップ (環境変数 APPROVAL_ROUTING_JSON 優先。VULN-240是正)
-function loadApprovalRouting()
-{
-    if (process.env.APPROVAL_ROUTING_JSON)
-    {
-        try
-        {
-            return JSON.parse(process.env.APPROVAL_ROUTING_JSON);
-        }
-        catch (e)
-        {
-            console.warn('[Security] APPROVAL_ROUTING_JSON パース失敗:', e.message);
-        }
-    }
-    return {
-        'satochan.07620@gmail.com': 'ketoshisub.2016@gmail.com',
-        'ketoshisub.2016@gmail.com': 'satochan.07620@gmail.com',
-        'tutuzisann@gmail.com': 'satochan.07620@gmail.com',
-        'zhouqingshui157@gmail.com': 'satochan.07620@gmail.com'
-    };
-}
-const APPROVAL_ROUTING = loadApprovalRouting();
-
-// 3日間 (72時間) スライディング有効期限定数
-const SESSION_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
-
-// 永続化ファイルパス
-const SECRET_KEY_FILE = path.join(DATA_DIR, 'hmac_secret.key');
-const REVOKED_TOKENS_FILE = path.join(DATA_DIR, 'revoked_tokens.json');
-const SESSIONS_FILE = path.join(SERVER_DIR, 'sessions.json');
-const QUEUE_FILE_PATH = path.join(DATA_DIR, 'offline_queue.json');
-const FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
-const OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
-const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
-const PHONE_STORE_FILE = path.join(DATA_DIR, 'phone_store.json');
-const VAULT_SECRETS_FILE = path.join(DATA_DIR, 'vault_secrets.json');
-const VAULT_STORE_FILE = path.join(DATA_DIR, 'vault_store.json');
-
-const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
-const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-
-// 永続的クラスタシークレット (Render等の揮発性コンテナでも再起動・更新ごとにセッション鍵が無効化しないよう永続保証)
-// CLUSTER_STABLE_HMAC_SECRET ハードコード廃止 (VULN-119是正)
-
-// VULN-61 & VULN-79是正: 環境変数優先、ファイル保持、クラスタ永続キーによる多重セッション永続化
-function loadOrCreateServerHmacSecret()
-{
-    const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
-    if (envSecret.length >= 32)
-    {
-        console.log('[Security] 環境変数 SESSION_HMAC_SECRET からHMACキーを設定しました');
-        return envSecret;
+    // UID形式の共通検証ヘルパー
+    function isValidUidFormat(uid) {
+        return typeof uid === 'string' && /^(u_[a-zA-Z0-9]{8,40}|bot_[a-zA-Z0-9_]{3,30})$/.test(uid);
     }
 
-    try
-    {
-        if (!fs.existsSync(DATA_DIR))
-        {
-            fs.mkdirSync(DATA_DIR, { recursive: true });
-        }
-        if (fs.existsSync(SECRET_KEY_FILE))
-        {
-            const savedKey = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
-            if (savedKey.length >= 32)
-            {
-                console.log('[Security] 保存済みキーファイルからHMACキーを復元しました');
-                return savedKey;
+    // 許可されたGoogleアカウントのSHA-256ハッシュリスト (小文字Hex)
+    const ALLOWED_EMAIL_HASHES = new Set([
+        '6838c7018bdd3e8d610196e5eeead1841bbba1f577d1a241aca19a0517edd5ac', // satochan...
+        '64ade2628e31414cfd703856b95d20762039f9eb7a252bd4f82ad30654f827c0', // ketoshi...
+        'cc62be47a00bd185613ae382f18ff5e162a525d01a36b72032e1efa086000597', // tutuzi...
+        '410e4631c35534c6c02708636b43e7b9313c262d866d01815632996faab9cccb'  // zhouqingshui157@gmail.com
+    ]);
+
+    // 相互承認ルーティングマップ (環境変数 APPROVAL_ROUTING_JSON 優先。SEC-03/VULN-240対策)
+    function loadApprovalRouting() {
+        const rawEnv = (process.env.APPROVAL_ROUTING_JSON || '').trim();
+        if (rawEnv) {
+            try {
+                const parsed = JSON.parse(rawEnv);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const normalized = {};
+                    for (const [k, v] of Object.entries(parsed)) {
+                        if (typeof k === 'string' && typeof v === 'string') {
+                            normalized[k.trim().toLowerCase()] = v.trim().toLowerCase();
+                        }
+                    }
+                    return normalized;
+                }
+            }
+            catch (e) {
+                console.warn('[Security] APPROVAL_ROUTING_JSON パース失敗:', e.message);
             }
         }
-
-        const generatedKey = crypto.randomBytes(32).toString('hex');
-        fs.writeFileSync(SECRET_KEY_FILE, generatedKey, { mode: 0o600 });
-        console.log('[Security] 新規ランダムHMAC署名キーを生成・保存しました');
-        return generatedKey;
+        console.warn('[Security Note] 環境変数 APPROVAL_ROUTING_JSON 未設定のため後方互換ルーティングを使用中');
+        return {
+            'satochan.07620@gmail.com': 'ketoshisub.2016@gmail.com',
+            'ketoshisub.2016@gmail.com': 'satochan.07620@gmail.com',
+            'tutuzisann@gmail.com': 'satochan.07620@gmail.com',
+            'zhouqingshui157@gmail.com': 'satochan.07620@gmail.com'
+        };
     }
-    catch (err)
-    {
-        console.error('[Security Error] HMACキー保存失敗、メモリ内動的生成キーを使用:', err);
-        return crypto.randomBytes(32).toString('hex');
-    }
-}
+    const APPROVAL_ROUTING = loadApprovalRouting();
 
-const SERVER_HMAC_SECRET = loadOrCreateServerHmacSecret();
-const STATE_ENC_KEY = crypto.createHash('sha256').update(`STATE_AES_GCM:${SERVER_HMAC_SECRET}`).digest();
+    // 3日間 (72時間) スライディング有効期限定数
+    const SESSION_DURATION_MS = 3 * 24 * 60 * 60 * 1000;
 
-// 各種インメモリストア
-const fcmTokenStore = new Map();
-const ipConnectionTracker = new Map();
-const otpStore = new Map();
-const activeSessions = new Map();
-const revokedTokens = new Map();
-const seenInviteNonces = new Set();
-const emailOtpCooldownTracker = new Map();
-const offlineMessageQueue = new Map();
-const offlineReadQueue = new Map();
-const attachmentAclStore = new Map();
-const profileStore = new Map();
-const PROFILES_FILE = path.join(DATA_DIR, 'profiles.json');
+    // 永続化ファイルパス (SEC-02: DATA_DIR配下へ統一し、旧パスは読込時のみフォールバック)
+    const SECRET_KEY_FILE = path.join(DATA_DIR, 'hmac_secret.key');
+    const REVOKED_TOKENS_FILE = path.join(DATA_DIR, 'revoked_tokens.json');
+    const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+    const LEGACY_SESSIONS_FILE = path.join(SERVER_DIR, 'sessions.json');
+    const QUEUE_FILE_PATH = path.join(DATA_DIR, 'offline_queue.json');
+    const FCM_TOKENS_FILE = path.join(DATA_DIR, 'fcm_tokens.json');
+    const LEGACY_FCM_TOKENS_FILE = path.join(SERVER_DIR, 'fcm_tokens.json');
+    const OFFLINE_READS_FILE = path.join(DATA_DIR, 'offline_reads.json');
+    const LEGACY_OFFLINE_READS_FILE = path.join(SERVER_DIR, 'offline_reads.json');
+    const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
+    const PHONE_STORE_FILE = path.join(DATA_DIR, 'phone_store.json');
+    const VAULT_SECRETS_FILE = path.join(DATA_DIR, 'vault_secrets.json');
+    const VAULT_STORE_FILE = path.join(DATA_DIR, 'vault_store.json');
 
-function saveProfiles()
-{
-    try
-    {
-        const obj = {};
-        for (const [uid, prof] of profileStore.entries())
-        {
-            obj[uid] = prof;
+    const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+    const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
+    // 永続的クラスタシークレット (Render等の揮発性コンテナでも再起動・更新ごとにセッション鍵が無効化しないよう永続保証)
+    // CLUSTER_STABLE_HMAC_SECRET ハードコード廃止 (VULN-119是正)
+
+    // VULN-61 & VULN-79是正: 環境変数優先、ファイル保持、クラスタ永続キーによる多重セッション永続化
+    function loadOrCreateServerHmacSecret() {
+        const envSecret = (process.env.SESSION_HMAC_SECRET || '').trim();
+        if (envSecret.length >= 32) {
+            console.log('[Security] 環境変数 SESSION_HMAC_SECRET からHMACキーを設定しました');
+            return envSecret;
         }
-        writeEncryptedJsonFile(PROFILES_FILE, obj);
-    }
-    catch (e)
-    {
-        console.error('[Profile Store Error] 保存失敗:', e);
-    }
-}
 
-function loadProfiles()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(PROFILES_FILE);
-        if (obj && typeof obj === 'object')
-        {
-            for (const [uid, prof] of Object.entries(obj))
-            {
-                profileStore.set(uid, prof);
+        try {
+            if (!fs.existsSync(DATA_DIR)) {
+                fs.mkdirSync(DATA_DIR, { recursive: true });
             }
-            console.log(`[Profile Store] ${profileStore.size} 件のプロフィールを復元`);
+            if (fs.existsSync(SECRET_KEY_FILE)) {
+                const savedKey = fs.readFileSync(SECRET_KEY_FILE, 'utf8').trim();
+                if (savedKey.length >= 32) {
+                    console.log('[Security] 保存済みキーファイルからHMACキーを復元しました');
+                    return savedKey;
+                }
+            }
+
+            const generatedKey = crypto.randomBytes(32).toString('hex');
+            fs.writeFileSync(SECRET_KEY_FILE, generatedKey, { mode: 0o600 });
+            console.log('[Security] 新規ランダムHMAC署名キーを生成・保存しました');
+            return generatedKey;
+        }
+        catch (err) {
+            console.error('[Security Error] HMACキー保存失敗、メモリ内動的生成キーを使用:', err);
+            return crypto.randomBytes(32).toString('hex');
         }
     }
-    catch (e)
-    {
-        console.error('[Profile Store Error] 復元失敗:', e);
-    }
-}
-const vaultSecretsStore = new Map();
-const vaultDataStore = new Map();
-// ユーザー電話番号管理ストア (Googleアカウント/email -> 電話番号・端末公開鍵・認証状態)
-const phoneStore = new Map();
-let remoteLoadPromise = null;
-let remoteLoadDone = false;
 
-// サーバー側Supabaseサービスロール利用可否判定
-function isSupabaseServiceReady()
-{
-    return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
-}
+    const SERVER_HMAC_SECRET = loadOrCreateServerHmacSecret();
+    const STATE_ENC_KEY = crypto.createHash('sha256').update(`STATE_AES_GCM:${SERVER_HMAC_SECRET}`).digest();
 
-// Supabase永続テーブルへの暗号化レコード保存 (サービスロール限定)
-async function supabaseServiceUpsert(recordId, tagNickname, payloadStr)
-{
-    if (!isSupabaseServiceReady() || !recordId || !payloadStr) { return false; }
-    try
-    {
-        const resp = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
-            method: 'POST',
-            headers: {
-                'apikey': SUPABASE_SERVICE_ROLE_KEY,
-                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-                'Content-Type': 'application/json',
-                'Prefer': 'resolution=merge-duplicates'
-            },
-            body: JSON.stringify({ id: recordId, nickname: tagNickname, photoUrl: payloadStr })
-        });
-        return resp.ok;
-    }
-    catch (e)
-    {
-        console.warn(`[Supabase Mirror] 保存スキップ (${recordId}):`, e.message);
-        return false;
-    }
-}
+    // 各種インメモリストア
+    const fcmTokenStore = new Map();
+    const ipConnectionTracker = new Map();
+    const otpStore = new Map();
+    const activeSessions = new Map();
+    const revokedTokens = new Map();
+    const seenInviteNonces = new Set();
+    const emailOtpCooldownTracker = new Map();
+    const chatSendRateLimitMap = new Map(); // fromUserId -> { count, resetAt } (HTTP/WS共通)
+    const offlineMessageQueue = new Map();
+    const offlineReadQueue = new Map();
+    const attachmentAclStore = new Map();
+    const profileStore = new Map();
+    const PROFILES_FILE = path.join(DATA_DIR, 'profiles.json');
 
-// Supabase永続テーブルからのレコード取得 (サービスロール限定)
-async function supabaseServiceSelect(recordId)
-{
-    if (!isSupabaseServiceReady() || !recordId) { return null; }
-    try
-    {
-        const url = `${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(recordId)}&select=photoUrl`;
-        const resp = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'apikey': SUPABASE_SERVICE_ROLE_KEY,
-                'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+    function saveProfiles() {
+        try {
+            const obj = {};
+            for (const [uid, prof] of profileStore.entries()) {
+                obj[uid] = prof;
             }
-        });
-        if (!resp.ok) { return null; }
-        const arr = await resp.json();
-        if (!Array.isArray(arr) || arr.length === 0) { return null; }
-        const val = arr[0] && typeof arr[0].photoUrl === 'string' ? arr[0].photoUrl : '';
-        return val || null;
+            writeEncryptedJsonFile(PROFILES_FILE, obj);
+        }
+        catch (e) {
+            console.error('[Profile Store Error] 保存失敗:', e);
+        }
     }
-    catch (e)
-    {
-        console.warn(`[Supabase Mirror] 取得スキップ (${recordId}):`, e.message);
-        return null;
-    }
-}
 
-// Supabase永続テーブルからのレコード消去/空化 (サービスロール限定)
-async function supabaseServiceScrub(recordId, safePlaceholder = '')
-{
-    if (!isSupabaseServiceReady() || !recordId) { return false; }
-    try
-    {
-        if (!safePlaceholder)
-        {
-            const delUrl = `${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(recordId)}`;
-            const resp = await fetch(delUrl, {
-                method: 'DELETE',
+    function loadProfiles() {
+        try {
+            const obj = readEncryptedJsonFile(PROFILES_FILE);
+            if (obj && typeof obj === 'object') {
+                for (const [uid, prof] of Object.entries(obj)) {
+                    profileStore.set(uid, prof);
+                }
+                console.log(`[Profile Store] ${profileStore.size} 件のプロフィールを復元`);
+            }
+        }
+        catch (e) {
+            console.error('[Profile Store Error] 復元失敗:', e);
+        }
+    }
+    const vaultSecretsStore = new Map();
+    const vaultDataStore = new Map();
+    // ユーザー電話番号管理ストア (Googleアカウント/email -> 電話番号・端末公開鍵・認証状態)
+    const phoneStore = new Map();
+    let remoteLoadPromise = null;
+    let remoteLoadDone = false;
+
+    // サーバー側Supabaseサービスロール利用可否判定
+    function isSupabaseServiceReady() {
+        return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+    }
+
+    // Supabase永続テーブルへの暗号化レコード保存 (サービスロール限定)
+    async function supabaseServiceUpsert(recordId, tagNickname, payloadStr) {
+        if (!isSupabaseServiceReady() || !recordId || !payloadStr) { return false; }
+        try {
+            const resp = await fetch(`${SUPABASE_URL}/rest/v1/users`, {
+                method: 'POST',
+                headers: {
+                    'apikey': SUPABASE_SERVICE_ROLE_KEY,
+                    'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'resolution=merge-duplicates'
+                },
+                body: JSON.stringify({ id: recordId, nickname: tagNickname, photoUrl: payloadStr })
+            });
+            return resp.ok;
+        }
+        catch (e) {
+            console.warn(`[Supabase Mirror] 保存スキップ (${recordId}):`, e.message);
+            return false;
+        }
+    }
+
+    // Supabase永続テーブルからのレコード取得 (サービスロール限定)
+    async function supabaseServiceSelect(recordId) {
+        if (!isSupabaseServiceReady() || !recordId) { return null; }
+        try {
+            const url = `${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(recordId)}&select=photoUrl`;
+            const resp = await fetch(url, {
+                method: 'GET',
                 headers: {
                     'apikey': SUPABASE_SERVICE_ROLE_KEY,
                     'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
                 }
             });
-            return resp.ok;
+            if (!resp.ok) { return null; }
+            const arr = await resp.json();
+            if (!Array.isArray(arr) || arr.length === 0) { return null; }
+            const val = arr[0] && typeof arr[0].photoUrl === 'string' ? arr[0].photoUrl : '';
+            return val || null;
         }
-        return await supabaseServiceUpsert(recordId, 'migrated_v4', safePlaceholder);
+        catch (e) {
+            console.warn(`[Supabase Mirror] 取得スキップ (${recordId}):`, e.message);
+            return null;
+        }
     }
-    catch (e)
-    {
-        console.warn(`[Supabase Mirror] 消去スキップ (${recordId}):`, e.message);
-        return false;
-    }
-}
 
-function mapToPlainObject(map)
-{
-    const obj = {};
-    for (const [k, v] of map.entries())
-    {
-        obj[k] = v;
+    // Supabase永続テーブルからのレコード消去/空化 (サービスロール限定)
+    async function supabaseServiceScrub(recordId, safePlaceholder = '') {
+        if (!isSupabaseServiceReady() || !recordId) { return false; }
+        try {
+            if (!safePlaceholder) {
+                const delUrl = `${SUPABASE_URL}/rest/v1/users?id=eq.${encodeURIComponent(recordId)}`;
+                const resp = await fetch(delUrl, {
+                    method: 'DELETE',
+                    headers: {
+                        'apikey': SUPABASE_SERVICE_ROLE_KEY,
+                        'Authorization': `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+                    }
+                });
+                return resp.ok;
+            }
+            return await supabaseServiceUpsert(recordId, 'migrated_v4', safePlaceholder);
+        }
+        catch (e) {
+            console.warn(`[Supabase Mirror] 消去スキップ (${recordId}):`, e.message);
+            return false;
+        }
     }
-    return obj;
-}
 
-function savePhoneStore()
-{
-    try
-    {
-        const obj = mapToPlainObject(phoneStore);
-        writeEncryptedJsonFile(PHONE_STORE_FILE, obj);
-        if (isSupabaseServiceReady())
-        {
-            const encPayload = encryptStatePayload(obj);
-            if (encPayload)
-            {
-                supabaseServiceUpsert('cp_srv_phone_store_v1', 'srv_phone', encPayload);
+    function mapToPlainObject(map) {
+        const obj = {};
+        for (const [k, v] of map.entries()) {
+            obj[k] = v;
+        }
+        return obj;
+    }
+
+    function savePhoneStore() {
+        try {
+            const obj = mapToPlainObject(phoneStore);
+            writeEncryptedJsonFile(PHONE_STORE_FILE, obj);
+            if (isSupabaseServiceReady()) {
+                const encPayload = encryptStatePayload(obj);
+                if (encPayload) {
+                    supabaseServiceUpsert('cp_srv_phone_store_v1', 'srv_phone', encPayload);
+                }
             }
         }
-    }
-    catch (e)
-    {
-        console.error('[Phone Store Error] 保存失敗:', e);
-    }
-}
-
-function loadPhoneStore()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(PHONE_STORE_FILE);
-        if (obj)
-        {
-            for (const [email, rec] of Object.entries(obj))
-            {
-                phoneStore.set(email, rec);
-            }
-            console.log(`[Phone Store] ${phoneStore.size} 件の電話番号登録情報を復元`);
+        catch (e) {
+            console.error('[Phone Store Error] 保存失敗:', e);
         }
     }
-    catch (e)
-    {
-        console.error('[Phone Store Error] 復元失敗:', e);
-    }
-}
 
-function saveVaultSecrets()
-{
-    try
-    {
-        const obj = mapToPlainObject(vaultSecretsStore);
-        writeEncryptedJsonFile(VAULT_SECRETS_FILE, obj);
-        if (isSupabaseServiceReady())
-        {
-            const encPayload = encryptStatePayload(obj);
-            if (encPayload)
-            {
-                supabaseServiceUpsert('cp_srv_vault_secrets_v1', 'srv_vsec', encPayload);
+    function loadPhoneStore() {
+        try {
+            const obj = readEncryptedJsonFile(PHONE_STORE_FILE);
+            if (obj) {
+                for (const [email, rec] of Object.entries(obj)) {
+                    phoneStore.set(email, rec);
+                }
+                console.log(`[Phone Store] ${phoneStore.size} 件の電話番号登録情報を復元`);
             }
         }
-    }
-    catch (e)
-    {
-        console.error('[Vault Secrets Error] 保存失敗:', e.message);
-    }
-}
-
-function loadVaultSecrets()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(VAULT_SECRETS_FILE);
-        if (!obj) { return; }
-        for (const [k, v] of Object.entries(obj))
-        {
-            vaultSecretsStore.set(k, v);
-        }
-        console.log(`[Vault Secrets] ${vaultSecretsStore.size} 件のアカウントラップシークレットを復元`);
-    }
-    catch (e)
-    {
-        console.error('[Vault Secrets Error] 復元失敗:', e.message);
-    }
-}
-
-function saveVaultDataStore()
-{
-    try
-    {
-        const obj = mapToPlainObject(vaultDataStore);
-        writeEncryptedJsonFile(VAULT_STORE_FILE, obj);
-    }
-    catch (e)
-    {
-        console.error('[Vault Data Error] 保存失敗:', e.message);
-    }
-}
-
-function loadVaultDataStore()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(VAULT_STORE_FILE);
-        if (!obj) { return; }
-        for (const [k, v] of Object.entries(obj))
-        {
-            vaultDataStore.set(k, v);
+        catch (e) {
+            console.error('[Phone Store Error] 復元失敗:', e);
         }
     }
-    catch (e)
-    {
-        console.error('[Vault Data Error] 復元失敗:', e.message);
+
+    function saveVaultSecrets() {
+        try {
+            const obj = mapToPlainObject(vaultSecretsStore);
+            writeEncryptedJsonFile(VAULT_SECRETS_FILE, obj);
+            if (isSupabaseServiceReady()) {
+                const encPayload = encryptStatePayload(obj);
+                if (encPayload) {
+                    supabaseServiceUpsert('cp_srv_vault_secrets_v1', 'srv_vsec', encPayload);
+                }
+            }
+        }
+        catch (e) {
+            console.error('[Vault Secrets Error] 保存失敗:', e.message);
+        }
     }
-}
 
-// Render起動直後・揮発後のSupabase永続ストア復元 (1度だけ実行し競合防止)
-async function ensureRemoteStoresLoaded()
-{
-    if (remoteLoadDone || !isSupabaseServiceReady()) { return; }
-    if (remoteLoadPromise) { return await remoteLoadPromise; }
+    function loadVaultSecrets() {
+        try {
+            const obj = readEncryptedJsonFile(VAULT_SECRETS_FILE);
+            if (!obj) { return; }
+            for (const [k, v] of Object.entries(obj)) {
+                vaultSecretsStore.set(k, v);
+            }
+            console.log(`[Vault Secrets] ${vaultSecretsStore.size} 件のアカウントラップシークレットを復元`);
+        }
+        catch (e) {
+            console.error('[Vault Secrets Error] 復元失敗:', e.message);
+        }
+    }
 
-    remoteLoadPromise = (async () =>
-    {
-        try
-        {
-            const rawPhone = await supabaseServiceSelect('cp_srv_phone_store_v1');
-            const decPhone = rawPhone ? decryptStatePayload(rawPhone) : null;
-            if (decPhone && typeof decPhone === 'object')
-            {
-                let restoredCount = 0;
-                for (const [email, rec] of Object.entries(decPhone))
-                {
-                    if (!phoneStore.has(email) && rec)
-                    {
-                        phoneStore.set(email, rec);
-                        restoredCount++;
+    function saveVaultDataStore() {
+        try {
+            const obj = mapToPlainObject(vaultDataStore);
+            writeEncryptedJsonFile(VAULT_STORE_FILE, obj);
+        }
+        catch (e) {
+            console.error('[Vault Data Error] 保存失敗:', e.message);
+        }
+    }
+
+    function loadVaultDataStore() {
+        try {
+            const obj = readEncryptedJsonFile(VAULT_STORE_FILE);
+            if (!obj) { return; }
+            for (const [k, v] of Object.entries(obj)) {
+                vaultDataStore.set(k, v);
+            }
+        }
+        catch (e) {
+            console.error('[Vault Data Error] 復元失敗:', e.message);
+        }
+    }
+
+    // Render起動直後・揮発後のSupabase永続ストア復元 (1度だけ実行し競合防止)
+    async function ensureRemoteStoresLoaded() {
+        if (remoteLoadDone || !isSupabaseServiceReady()) { return; }
+        if (remoteLoadPromise) { return await remoteLoadPromise; }
+
+        remoteLoadPromise = (async () => {
+            try {
+                const rawPhone = await supabaseServiceSelect('cp_srv_phone_store_v1');
+                const decPhone = rawPhone ? decryptStatePayload(rawPhone) : null;
+                if (decPhone && typeof decPhone === 'object') {
+                    let restoredCount = 0;
+                    for (const [email, rec] of Object.entries(decPhone)) {
+                        if (!phoneStore.has(email) && rec) {
+                            phoneStore.set(email, rec);
+                            restoredCount++;
+                        }
+                    }
+                    if (restoredCount > 0) {
+                        writeEncryptedJsonFile(PHONE_STORE_FILE, mapToPlainObject(phoneStore));
+                        console.log(`[Remote Store Sync] Supabaseから ${restoredCount} 件の端末登録を復元しました`);
                     }
                 }
-                if (restoredCount > 0)
-                {
-                    writeEncryptedJsonFile(PHONE_STORE_FILE, mapToPlainObject(phoneStore));
-                    console.log(`[Remote Store Sync] Supabaseから ${restoredCount} 件の端末登録を復元しました`);
-                }
-            }
 
-            const rawSecrets = await supabaseServiceSelect('cp_srv_vault_secrets_v1');
-            const decSecrets = rawSecrets ? decryptStatePayload(rawSecrets) : null;
-            if (decSecrets && typeof decSecrets === 'object')
-            {
-                let secCount = 0;
-                for (const [k, v] of Object.entries(decSecrets))
-                {
-                    if (!vaultSecretsStore.has(k) && v)
-                    {
-                        vaultSecretsStore.set(k, v);
-                        secCount++;
+                const rawSecrets = await supabaseServiceSelect('cp_srv_vault_secrets_v1');
+                const decSecrets = rawSecrets ? decryptStatePayload(rawSecrets) : null;
+                if (decSecrets && typeof decSecrets === 'object') {
+                    let secCount = 0;
+                    for (const [k, v] of Object.entries(decSecrets)) {
+                        if (!vaultSecretsStore.has(k) && v) {
+                            vaultSecretsStore.set(k, v);
+                            secCount++;
+                        }
+                    }
+                    if (secCount > 0) {
+                        writeEncryptedJsonFile(VAULT_SECRETS_FILE, mapToPlainObject(vaultSecretsStore));
+                        console.log(`[Remote Store Sync] Supabaseから ${secCount} 件のVaultシークレットを復元しました`);
                     }
                 }
-                if (secCount > 0)
-                {
-                    writeEncryptedJsonFile(VAULT_SECRETS_FILE, mapToPlainObject(vaultSecretsStore));
-                    console.log(`[Remote Store Sync] Supabaseから ${secCount} 件のVaultシークレットを復元しました`);
-                }
             }
+            catch (e) {
+                console.warn('[Remote Store Sync] 復元警告:', e.message);
+            }
+            finally {
+                remoteLoadDone = true;
+                remoteLoadPromise = null;
+            }
+        })();
+
+        return await remoteLoadPromise;
+    }
+
+    // アカウント固有のランダム32B Vault暗号化シークレット取得または新規発行
+    async function getOrCreateVaultSecretB64(email) {
+        await ensureRemoteStoresLoaded();
+        const emailHash = sha256(email);
+        const existing = vaultSecretsStore.get(emailHash);
+        if (existing && typeof existing.secretB64 === 'string' && existing.secretB64.length >= 32) {
+            return existing.secretB64;
         }
-        catch (e)
-        {
-            console.warn('[Remote Store Sync] 復元警告:', e.message);
+        const newSecret = crypto.randomBytes(32).toString('base64');
+        enforceMapSizeCap(vaultSecretsStore, 5000);
+        vaultSecretsStore.set(emailHash, {
+            secretB64: newSecret,
+            createdAt: Date.now()
+        });
+        saveVaultSecrets();
+        return newSecret;
+    }
+
+    const recentChatPacketIds = new Map();
+    const rooms = new Map();
+    const users = new Map();
+    const wsIpConnectionCount = new Map();
+
+    // Mapの最大エントリ数上限保護 (メモリ枯渇DoS防止: No.16対策)
+    function enforceMapSizeCap(map, maxEntries = 5000) {
+        while (map.size > maxEntries) {
+            const oldestKey = map.keys().next().value;
+            if (oldestKey === undefined) { break; }
+            map.delete(oldestKey);
         }
-        finally
-        {
-            remoteLoadDone = true;
-            remoteLoadPromise = null;
+    }
+
+    // 永続化オブジェクト用AES-256-GCM暗号化・復号ヘルパー (No.16対策)
+    function encryptStatePayload(obj) {
+        try {
+            const plain = JSON.stringify(obj);
+            const iv = crypto.randomBytes(12);
+            const cipher = crypto.createCipheriv('aes-256-gcm', STATE_ENC_KEY, iv);
+            const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+            const tag = cipher.getAuthTag();
+            return `ENC_STATE_V1:${iv.toString('hex')}:${tag.toString('hex')}:${enc.toString('hex')}`;
         }
-    })();
-
-    return await remoteLoadPromise;
-}
-
-// アカウント固有のランダム32B Vault暗号化シークレット取得または新規発行
-async function getOrCreateVaultSecretB64(email)
-{
-    await ensureRemoteStoresLoaded();
-    const emailHash = sha256(email);
-    const existing = vaultSecretsStore.get(emailHash);
-    if (existing && typeof existing.secretB64 === 'string' && existing.secretB64.length >= 32)
-    {
-        return existing.secretB64;
-    }
-    const newSecret = crypto.randomBytes(32).toString('base64');
-    enforceMapSizeCap(vaultSecretsStore, 5000);
-    vaultSecretsStore.set(emailHash, {
-        secretB64: newSecret,
-        createdAt: Date.now()
-    });
-    saveVaultSecrets();
-    return newSecret;
-}
-
-const recentChatPacketIds = new Map();
-const rooms = new Map();
-const users = new Map();
-const wsIpConnectionCount = new Map();
-
-// Mapの最大エントリ数上限保護 (メモリ枯渇DoS防止: No.16対策)
-function enforceMapSizeCap(map, maxEntries = 5000)
-{
-    while (map.size > maxEntries)
-    {
-        const oldestKey = map.keys().next().value;
-        if (oldestKey === undefined) { break; }
-        map.delete(oldestKey);
-    }
-}
-
-// 永続化オブジェクト用AES-256-GCM暗号化・復号ヘルパー (No.16対策)
-function encryptStatePayload(obj)
-{
-    try
-    {
-        const plain = JSON.stringify(obj);
-        const iv = crypto.randomBytes(12);
-        const cipher = crypto.createCipheriv('aes-256-gcm', STATE_ENC_KEY, iv);
-        const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
-        const tag = cipher.getAuthTag();
-        return `ENC_STATE_V1:${iv.toString('hex')}:${tag.toString('hex')}:${enc.toString('hex')}`;
-    }
-    catch (e)
-    {
-        console.error('[Encrypted Store] 暗号化エラー:', e.message);
-        return '';
-    }
-}
-
-function decryptStatePayload(rawText)
-{
-    const raw = (rawText || '').trim();
-    if (!raw) { return null; }
-    try
-    {
-        if (raw.startsWith('ENC_STATE_V1:'))
-        {
-            const parts = raw.split(':');
-            if (parts.length !== 4) { return null; }
-            const iv = Buffer.from(parts[1], 'hex');
-            const tag = Buffer.from(parts[2], 'hex');
-            const enc = Buffer.from(parts[3], 'hex');
-            const decipher = crypto.createDecipheriv('aes-256-gcm', STATE_ENC_KEY, iv);
-            decipher.setAuthTag(tag);
-            const decStr = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
-            return JSON.parse(decStr);
+        catch (e) {
+            console.error('[Encrypted Store] 暗号化エラー:', e.message);
+            return '';
         }
-        return JSON.parse(raw);
     }
-    catch (e)
-    {
-        console.warn('[Encrypted Store] 復号エラー:', e.message);
-        return null;
-    }
-}
 
-function writeEncryptedJsonFile(filePath, obj)
-{
-    try
-    {
-        const dir = path.dirname(filePath);
-        if (!fs.existsSync(dir))
-        {
-            fs.mkdirSync(dir, { recursive: true });
+    function decryptStatePayload(rawText) {
+        const raw = (rawText || '').trim();
+        if (!raw) { return null; }
+        try {
+            if (raw.startsWith('ENC_STATE_V1:')) {
+                const parts = raw.split(':');
+                if (parts.length !== 4) { return null; }
+                const iv = Buffer.from(parts[1], 'hex');
+                const tag = Buffer.from(parts[2], 'hex');
+                const enc = Buffer.from(parts[3], 'hex');
+                const decipher = crypto.createDecipheriv('aes-256-gcm', STATE_ENC_KEY, iv);
+                decipher.setAuthTag(tag);
+                const decStr = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+                return JSON.parse(decStr);
+            }
+            return JSON.parse(raw);
         }
-        const payload = encryptStatePayload(obj);
-        if (!payload) { return; }
-        fs.writeFileSync(filePath, payload, { encoding: 'utf8', mode: 0o600 });
+        catch (e) {
+            console.warn('[Encrypted Store] 復号エラー:', e.message);
+            return null;
+        }
     }
-    catch (e)
-    {
-        console.error(`[Encrypted Store] 保存エラー (${path.basename(filePath)}):`, e.message);
+
+    function writeEncryptedJsonFile(filePath, obj) {
+        try {
+            const dir = path.dirname(filePath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+            const payload = encryptStatePayload(obj);
+            if (!payload) { return; }
+            fs.writeFileSync(filePath, payload, { encoding: 'utf8', mode: 0o600 });
+        }
+        catch (e) {
+            console.error(`[Encrypted Store] 保存エラー (${path.basename(filePath)}):`, e.message);
+        }
     }
-}
 
-function readEncryptedJsonFile(filePath)
-{
-    if (!fs.existsSync(filePath)) { return null; }
-    const raw = fs.readFileSync(filePath, 'utf8');
-    return decryptStatePayload(raw);
-}
-
-// メールアドレスの伏字マスク
-function maskEmail(addr)
-{
-    if (!addr || !addr.includes('@')) { return addr || ''; }
-    const parts = addr.split('@');
-    const name = parts[0];
-    const visible = name.length > 3 ? name.slice(0, 3) : name.slice(0, 1);
-    return `${visible}***@${parts[1]}`;
-}
-
-// 文字列のSHA-256ハッシュ算出
-function sha256(text)
-{
-    return crypto.createHash('sha256').update(String(text || '').toLowerCase().trim()).digest('hex');
-}
-
-function saveRevokedTokens()
-{
-    const obj = {};
-    const now = Date.now();
-    for (const [k, exp] of revokedTokens.entries())
-    {
-        if (exp > now) { obj[k] = exp; }
+    function readEncryptedJsonFile(filePath) {
+        if (!fs.existsSync(filePath)) { return null; }
+        const raw = fs.readFileSync(filePath, 'utf8');
+        return decryptStatePayload(raw);
     }
-    writeEncryptedJsonFile(REVOKED_TOKENS_FILE, obj);
-}
 
-function loadRevokedTokens()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(REVOKED_TOKENS_FILE);
-        if (!obj) { return; }
+    // メールアドレスの伏字マスク
+    function maskEmail(addr) {
+        if (!addr || !addr.includes('@')) { return addr || ''; }
+        const parts = addr.split('@');
+        const name = parts[0];
+        const visible = name.length > 3 ? name.slice(0, 3) : name.slice(0, 1);
+        return `${visible}***@${parts[1]}`;
+    }
+
+    // 文字列のSHA-256ハッシュ算出
+    function sha256(text) {
+        return crypto.createHash('sha256').update(String(text || '').toLowerCase().trim()).digest('hex');
+    }
+
+    function saveRevokedTokens() {
+        const obj = {};
         const now = Date.now();
-        for (const [k, exp] of Object.entries(obj))
-        {
-            if (Number(exp) > now) { revokedTokens.set(k, Number(exp)); }
+        for (const [k, exp] of revokedTokens.entries()) {
+            if (exp > now) { obj[k] = exp; }
         }
+        writeEncryptedJsonFile(REVOKED_TOKENS_FILE, obj);
     }
-    catch (e)
-    {
-        console.error('[Revoked Token Store] 復元エラー:', e.message);
-    }
-}
 
-// トークン失効登録 (No.03 ゾンビセッション完全遮断)
-function revokeSessionToken(token, graceMs = 0)
-{
-    if (!token || typeof token !== 'string') { return; }
-    if (graceMs > 0)
-    {
-        // Grace Period内は有効セッションとして維持し、猶予期間経過後に完全失効
-        const graceExp = Date.now() + graceMs;
-        if (activeSessions.has(token))
-        {
-            const s = activeSessions.get(token);
-            if (s && s.expiresAt > graceExp)
-            {
-                s.expiresAt = graceExp;
+    function loadRevokedTokens() {
+        try {
+            const obj = readEncryptedJsonFile(REVOKED_TOKENS_FILE);
+            if (!obj) { return; }
+            const now = Date.now();
+            for (const [k, exp] of Object.entries(obj)) {
+                if (Number(exp) > now) { revokedTokens.set(k, Number(exp)); }
             }
         }
-        setTimeout(() => {
-            revokeSessionToken(token, 0);
-        }, graceMs);
-        return;
+        catch (e) {
+            console.error('[Revoked Token Store] 復元エラー:', e.message);
+        }
     }
 
-    const exp = Date.now() + SESSION_DURATION_MS;
-    const tokenHash = sha256(token);
-    revokedTokens.set(tokenHash, exp);
-    if (token.startsWith('st1.'))
-    {
-        try
-        {
+    // トークンからjtiクレームを安全抽出
+    function extractTokenJti(token) {
+        if (!token || typeof token !== 'string' || !token.startsWith('st1.')) { return ''; }
+        try {
             const parts = token.split('.');
-            if (parts.length === 3)
-            {
-                const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-                if (payload && payload.jti)
-                {
-                    revokedTokens.set(`jti:${payload.jti}`, payload.exp || exp);
+            if (parts.length !== 3) { return ''; }
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            return payload && typeof payload.jti === 'string' ? payload.jti : '';
+        }
+        catch (e) {
+            return '';
+        }
+    }
+
+    // 失効トークンに紐づくアクティブWebSocket接続を即時遮断 (SEC-05)
+    function disconnectRevokedWebSockets(revokedToken, revokedJti = '') {
+        const targetHash = sha256(revokedToken);
+        const matchesSocket = (wsToken, wsJti) => {
+            if (!wsToken) { return false; }
+            if (sha256(wsToken) === targetHash) { return true; }
+            return Boolean(revokedJti && wsJti && wsJti === revokedJti);
+        };
+        const closeSocket = (ws) => {
+            if (!ws || ws.readyState !== 1) { return; }
+            try { ws.send(JSON.stringify({ type: 'auth_error', message: 'セッションが失効しました。再ログインしてください' })); } catch (e) { }
+            try { ws.close(4001, 'Session revoked'); } catch (e) { }
+        };
+
+        for (const [uid, entry] of users.entries()) {
+            if (entry && matchesSocket(entry.token, entry.ws?.sessionJti)) {
+                users.delete(uid);
+                closeSocket(entry.ws);
+            }
+        }
+        for (const room of rooms.values()) {
+            for (const client of Array.from(room)) {
+                if (client?.ws && matchesSocket(client.ws.sessionToken, client.ws.sessionJti)) {
+                    room.delete(client);
+                    closeSocket(client.ws);
                 }
             }
         }
-        catch (e) {}
     }
-    activeSessions.delete(token);
-    // VULN-241是正: 期限切れ失効トークンを優先クリーンアップして上限追い出しによる復活を防止
-    const nowTime = Date.now();
-    for (const [k, vExp] of revokedTokens.entries())
-    {
-        if (vExp && vExp < nowTime)
-        {
-            revokedTokens.delete(k);
-        }
-    }
-    enforceMapSizeCap(revokedTokens, 20000);
-    saveRevokedTokens();
-    saveSessions();
-}
-function saveSessions()
-{
-    const obj = {};
-    for (const [k, v] of activeSessions.entries())
-    {
-        obj[k] = v;
-    }
-    writeEncryptedJsonFile(SESSIONS_FILE, obj);
-}
 
-function loadSessions()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(SESSIONS_FILE);
-        if (!obj) { return; }
-        const now = Date.now();
-        for (const [k, v] of Object.entries(obj))
-        {
-            if (v && v.expiresAt > now && !isTokenRevoked(k, v.jti))
-            {
-                activeSessions.set(k, v);
+    // トークン失効登録 (No.03 ゾンビセッション完全遮断 + WebSocket即時切断)
+    function revokeSessionToken(token, graceMs = 0) {
+        if (!token || typeof token !== 'string') { return; }
+        if (graceMs > 0) {
+            // Grace Period内は有効セッションとして維持し、猶予期間経過後に完全失効
+            const graceExp = Date.now() + graceMs;
+            if (activeSessions.has(token)) {
+                const s = activeSessions.get(token);
+                if (s && s.expiresAt > graceExp) {
+                    s.expiresAt = graceExp;
+                }
             }
+            setTimeout(() => {
+                revokeSessionToken(token, 0);
+            }, graceMs);
+            return;
         }
-        console.log(`[Session Store] ${activeSessions.size} 件のアクティブセッションを復元完了`);
-    }
-    catch (e)
-    {
-        console.error('[Session Store] 復元エラー:', e.message);
-    }
-}
 
-// ステートレスHMAC署名付きセッショントークンの生成 (st1.<payloadBase64Url>.<hmacHex>)
-function createStatelessSessionToken(email, deviceUid, expiresAt)
-{
-    const cleanEmail = (email || '').trim().toLowerCase();
-    const payloadObj = {
-        email: cleanEmail,
-        emailHash: sha256(cleanEmail),
-        uid: (deviceUid || '').trim(),
-        jti: crypto.randomBytes(12).toString('hex'),
-        iat: Date.now(),
-        exp: expiresAt
-    };
-    const payloadB64 = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
-    const sig = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
-    return `st1.${payloadB64}.${sig}`;
-}
-
-// ステートレスHMAC署名付きセッショントークンの検証・メモリ復元
-function verifyAndRestoreStatelessToken(token)
-{
-    if (!token || typeof token !== 'string' || !token.startsWith('st1.')) { return null; }
-    if (isTokenRevoked(token)) { return null; }
-    const parts = token.split('.');
-    if (parts.length !== 3) { return null; }
-    const payloadB64 = parts[1];
-    const sig = parts[2];
-    const expectedPrimary = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
-    if (sig.length !== expectedPrimary.length || !crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8')))
-    {
-        return null;
-    }
-    try
-    {
-        const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-        if (!payload || !payload.uid || !payload.exp || payload.exp <= Date.now()) { return null; }
-        if (isTokenRevoked(token, payload.jti || '')) { return null; }
-        const restored = {
-            email: payload.email || '',
-            emailHash: payload.emailHash || sha256(payload.email || ''),
-            deviceUid: payload.uid,
-            jti: payload.jti || '',
-            createdAt: payload.iat || Date.now(),
-            expiresAt: payload.exp,
-            lastExtendedAt: Date.now()
-        };
-        enforceMapSizeCap(activeSessions, 5000);
-        activeSessions.set(token, restored);
-        saveSessions();
-        return restored;
-    }
-    catch (e)
-    {
-        return null;
-    }
-}
-
-// セッショントークン＆物理端末UIDバインド厳格検証
-function isValidSession(token, userId, slideExtension = true)
-{
-    if (!token || typeof token !== 'string') { return false; }
-    if (isTokenRevoked(token))
-    {
+        const exp = Date.now() + SESSION_DURATION_MS;
+        const tokenHash = sha256(token);
+        revokedTokens.set(tokenHash, exp);
+        let revokedJti = '';
+        if (token.startsWith('st1.')) {
+            try {
+                const parts = token.split('.');
+                if (parts.length === 3) {
+                    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+                    if (payload && payload.jti) {
+                        revokedJti = payload.jti;
+                        revokedTokens.set(`jti:${payload.jti}`, payload.exp || exp);
+                    }
+                }
+            }
+            catch (e) { }
+        }
         activeSessions.delete(token);
-        return false;
-    }
-    if (!activeSessions.has(token) && token.startsWith('st1.'))
-    {
-        verifyAndRestoreStatelessToken(token);
-    }
-    if (activeSessions.has(token))
-    {
-        const session = activeSessions.get(token);
-        const now = Date.now();
-        if (session && session.expiresAt > now && !isTokenRevoked(token, session.jti || ''))
-        {
-            if (!session.deviceUid)
-            {
-                console.warn('[Security Block] deviceUidのない無効なセッションを遮断');
-                return false;
+        disconnectRevokedWebSockets(token, revokedJti);
+        // VULN-241是正: 期限切れ失効トークンを優先クリーンアップして上限追い出しによる復活を防止
+        const nowTime = Date.now();
+        for (const [k, vExp] of revokedTokens.entries()) {
+            if (vExp && vExp < nowTime) {
+                revokedTokens.delete(k);
             }
-            // VULN-320是正: userIdが指定された場合は厳格照合し、空文字・不一致は遮断
-            if (userId !== undefined && userId !== null && userId !== '')
-            {
-                if (session.deviceUid !== userId)
-                {
-                    console.warn(`[Security Block] 端末UID不一致によるセッション遮断: 所持=${session.deviceUid}, 要求=${userId}`);
+        }
+        enforceMapSizeCap(revokedTokens, 20000);
+        saveRevokedTokens();
+        saveSessions();
+    }
+    function saveSessions() {
+        const obj = {};
+        for (const [k, v] of activeSessions.entries()) {
+            obj[k] = v;
+        }
+        writeEncryptedJsonFile(SESSIONS_FILE, obj);
+    }
+
+    // 新DATA_DIR優先・旧SERVER_DIR配置からの互換フォールバック読取
+    function readEncryptedStoreWithLegacyFallback(primaryPath, legacyPath) {
+        const primary = readEncryptedJsonFile(primaryPath);
+        if (primary !== null) { return primary; }
+        if (legacyPath && legacyPath !== primaryPath) {
+            return readEncryptedJsonFile(legacyPath);
+        }
+        return null;
+    }
+
+    function loadSessions() {
+        try {
+            const obj = readEncryptedStoreWithLegacyFallback(SESSIONS_FILE, LEGACY_SESSIONS_FILE);
+            if (!obj) { return; }
+            const now = Date.now();
+            for (const [k, v] of Object.entries(obj)) {
+                if (v && v.expiresAt > now && !isTokenRevoked(k, v.jti)) {
+                    activeSessions.set(k, v);
+                }
+            }
+            console.log(`[Session Store] ${activeSessions.size} 件のアクティブセッションを復元完了`);
+        }
+        catch (e) {
+            console.error('[Session Store] 復元エラー:', e.message);
+        }
+    }
+
+    // ステートレスHMAC署名付きセッショントークンの生成 (st1.<payloadBase64Url>.<hmacHex>)
+    function createStatelessSessionToken(email, deviceUid, expiresAt) {
+        const cleanEmail = (email || '').trim().toLowerCase();
+        const payloadObj = {
+            email: cleanEmail,
+            emailHash: sha256(cleanEmail),
+            uid: (deviceUid || '').trim(),
+            jti: crypto.randomBytes(12).toString('hex'),
+            iat: Date.now(),
+            exp: expiresAt
+        };
+        const payloadB64 = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
+        const sig = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
+        return `st1.${payloadB64}.${sig}`;
+    }
+
+    // ステートレスHMAC署名付きセッショントークンの検証・メモリ復元
+    function verifyAndRestoreStatelessToken(token) {
+        if (!token || typeof token !== 'string' || !token.startsWith('st1.')) { return null; }
+        if (isTokenRevoked(token)) { return null; }
+        const parts = token.split('.');
+        if (parts.length !== 3) { return null; }
+        const payloadB64 = parts[1];
+        const sig = parts[2];
+        const expectedPrimary = crypto.createHmac('sha256', SERVER_HMAC_SECRET).update(payloadB64).digest('hex');
+        if (sig.length !== expectedPrimary.length || !crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expectedPrimary, 'utf8'))) {
+            return null;
+        }
+        try {
+            const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+            if (!payload || !payload.uid || !payload.exp || payload.exp <= Date.now()) { return null; }
+            if (isTokenRevoked(token, payload.jti || '')) { return null; }
+            const restored = {
+                email: payload.email || '',
+                emailHash: payload.emailHash || sha256(payload.email || ''),
+                deviceUid: payload.uid,
+                jti: payload.jti || '',
+                createdAt: payload.iat || Date.now(),
+                expiresAt: payload.exp,
+                lastExtendedAt: Date.now()
+            };
+            enforceMapSizeCap(activeSessions, 5000);
+            activeSessions.set(token, restored);
+            saveSessions();
+            return restored;
+        }
+        catch (e) {
+            return null;
+        }
+    }
+
+    // セッショントークン＆物理端末UIDバインド厳格検証
+    function isValidSession(token, userId, slideExtension = true) {
+        if (!token || typeof token !== 'string') { return false; }
+        if (isTokenRevoked(token)) {
+            activeSessions.delete(token);
+            return false;
+        }
+        if (!activeSessions.has(token) && token.startsWith('st1.')) {
+            verifyAndRestoreStatelessToken(token);
+        }
+        if (activeSessions.has(token)) {
+            const session = activeSessions.get(token);
+            const now = Date.now();
+            if (session && session.expiresAt > now && !isTokenRevoked(token, session.jti || '')) {
+                if (!isValidUidFormat(session.deviceUid)) {
+                    console.warn('[Security Block] 不正なdeviceUidを含む無効セッションを遮断');
                     return false;
                 }
+                // SEC-04是正: userId引数が渡された場合は空文字・null・不一致すべてを厳格遮断 (undefined時のみトークン単体検証)
+                if (userId !== undefined) {
+                    if (typeof userId !== 'string' || !userId || session.deviceUid !== userId) {
+                        console.warn(`[Security Block] 端末UID不一致または空UIDによるセッション遮断: 所持=${session.deviceUid}`);
+                        return false;
+                    }
+                }
+                const MAX_ABSOLUTE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
+                if (session.createdAt && (now - session.createdAt > MAX_ABSOLUTE_LIFETIME)) {
+                    console.warn(`[Security Block] セッション絶対有効期限(30日)超過: uid=${session.deviceUid}`);
+                    activeSessions.delete(token);
+                    saveSessions();
+                    return false;
+                }
+                if (slideExtension && (now - (session.lastExtendedAt || 0) > 3600000)) {
+                    session.expiresAt = now + SESSION_DURATION_MS;
+                    session.lastExtendedAt = now;
+                    saveSessions();
+                }
+                return true;
             }
-            const MAX_ABSOLUTE_LIFETIME = 30 * 24 * 60 * 60 * 1000;
-            if (session.createdAt && (now - session.createdAt > MAX_ABSOLUTE_LIFETIME))
-            {
-                console.warn(`[Security Block] セッション絶対有効期限(30日)超過: uid=${session.deviceUid}`);
-                activeSessions.delete(token);
-                saveSessions();
-                return false;
-            }
-            if (slideExtension && (now - (session.lastExtendedAt || 0) > 3600000))
-            {
-                session.expiresAt = now + SESSION_DURATION_MS;
-                session.lastExtendedAt = now;
-                saveSessions();
-            }
-            return true;
-        }
-        activeSessions.delete(token);
-        saveSessions();
-    }
-    return false;
-}
-
-
-function isTokenRevoked(token, jti = '')
-{
-    if (!token || typeof token !== 'string') { return true; }
-    const now = Date.now();
-    const tokenHash = sha256(token);
-    const exp = revokedTokens.get(tokenHash);
-    if (exp && exp > now) { return true; }
-    if (jti)
-    {
-        const jtiExp = revokedTokens.get(`jti:${jti}`);
-        if (jtiExp && jtiExp > now) { return true; }
-    }
-    return false;
-}
-
-// HTTPヘッダーからBearerトークンを安全抽出
-function extractBearerToken(req)
-{
-    const authHeader = req.headers['authorization'] || '';
-    if (authHeader.startsWith('Bearer '))
-    {
-        return authHeader.slice(7).trim();
-    }
-    return '';
-}
-
-function loadOfflineQueue()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(QUEUE_FILE_PATH);
-        if (!obj) { return; }
-        for (const [userId, messages] of Object.entries(obj))
-        {
-            if (Array.isArray(messages) && messages.length > 0)
-            {
-                offlineMessageQueue.set(userId, messages);
-            }
-        }
-        console.log(`[Offline Queue] ${offlineMessageQueue.size} ユーザー分のキューを復元完了`);
-    }
-    catch (err)
-    {
-        console.error('[Offline Queue Load Error]', err.message);
-    }
-}
-
-let saveQueueTimer = null;
-function saveOfflineQueue()
-{
-    if (saveQueueTimer) { clearTimeout(saveQueueTimer); }
-    saveQueueTimer = setTimeout(() =>
-    {
-        const obj = {};
-        for (const [userId, messages] of offlineMessageQueue.entries())
-        {
-            if (messages && messages.length > 0) { obj[userId] = messages; }
-        }
-        writeEncryptedJsonFile(QUEUE_FILE_PATH, obj);
-    }, 200);
-}
-
-
-// VULN-34是正: 添付ファイルACLの暗号化永続化保存・復元
-function saveAttachmentAcls()
-{
-    const obj = {};
-    for (const [k, v] of attachmentAclStore.entries())
-    {
-        obj[k] = v;
-    }
-    writeEncryptedJsonFile(ATTACHMENT_ACLS_FILE, obj);
-}
-
-function loadAttachmentAcls()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(ATTACHMENT_ACLS_FILE);
-        if (!obj) { return; }
-        for (const [k, v] of Object.entries(obj))
-        {
-            if (v && v.uploaderUid)
-            {
-                attachmentAclStore.set(k, v);
-            }
-        }
-        console.log(`[Attachment ACL Store] ${attachmentAclStore.size} 件のファイル認可情報を復元完了`);
-    }
-    catch (e)
-    {
-        console.error('[Attachment ACL Store] 復元エラー:', e.message);
-    }
-}
-
-function saveFcmTokens()
-{
-    const obj = {};
-    for (const [k, v] of fcmTokenStore.entries()) { obj[k] = v; }
-    writeEncryptedJsonFile(FCM_TOKENS_FILE, obj);
-}
-
-function loadFcmTokens()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(FCM_TOKENS_FILE);
-        if (!obj) { return; }
-        for (const [k, v] of Object.entries(obj)) { fcmTokenStore.set(k, v); }
-        console.log(`[FCM Store] ${fcmTokenStore.size} 件のFCMトークンを復元完了`);
-    }
-    catch (e)
-    {
-        console.error('[FCM Store] トークン復元エラー:', e.message);
-    }
-}
-
-function saveOfflineReads()
-{
-    const obj = {};
-    for (const [k, v] of offlineReadQueue.entries()) { obj[k] = v; }
-    writeEncryptedJsonFile(OFFLINE_READS_FILE, obj);
-}
-
-function loadOfflineReads()
-{
-    try
-    {
-        const obj = readEncryptedJsonFile(OFFLINE_READS_FILE);
-        if (!obj) { return; }
-        for (const [k, v] of Object.entries(obj)) { offlineReadQueue.set(k, v); }
-        console.log(`[Offline Read Store] ${offlineReadQueue.size} ユーザーの通知を復元完了`);
-    }
-    catch (e)
-    {
-        console.error('[Offline Read Store] 復元エラー:', e.message);
-    }
-}
-
-// JSONリクエストボディの取得ヘルパー (最大5MB上限: OOM DoS完全防御)
-function parseJsonBody(req, maxBytes = 5 * 1024 * 1024)
-{
-    return new Promise((resolve, reject) =>
-    {
-        let body = '';
-        let received = 0;
-        req.on('data', chunk =>
-        {
-            received += chunk.length;
-            if (received > maxBytes)
-            {
-                req.destroy();
-                return reject(new Error('Payload Too Large: JSONボディが上限(5MB)を超過しました'));
-            }
-            body += chunk;
-        });
-        req.on('end', () =>
-        {
-            try
-            {
-                resolve(body ? JSON.parse(body) : {});
-            }
-            catch (err)
-            {
-                reject(err);
-            }
-        });
-        req.on('error', reject);
-    });
-}
-
-// グレースフルシャットダウン用同期フラッシュ
-function flushAllStoresSync()
-{
-    try
-    {
-        if (saveQueueTimer)
-        {
-            clearTimeout(saveQueueTimer);
-            saveQueueTimer = null;
-        }
-        const queueObj = {};
-        for (const [userId, messages] of offlineMessageQueue.entries())
-        {
-            if (messages && messages.length > 0) { queueObj[userId] = messages; }
-        }
-        writeEncryptedJsonFile(QUEUE_FILE_PATH, queueObj);
-        saveSessions();
-        saveRevokedTokens();
-        saveFcmTokens();
-        saveOfflineReads();
-        saveAttachmentAcls();
-        saveProfiles();
-        savePhoneStore();
-        saveVaultSecrets();
-        saveVaultDataStore();
-        console.log('[Graceful Shutdown] 全永続化ストアの暗号化同期保存が完了しました');
-    }
-    catch (e)
-    {
-        console.error('[Graceful Shutdown Error]', e.message);
-    }
-}
-
-// 起動時ロードと定期クリーンアップ開始
-loadRevokedTokens();
-loadSessions();
-loadOfflineQueue();
-loadFcmTokens();
-loadOfflineReads();
-loadAttachmentAcls();
-loadProfiles();
-loadPhoneStore();
-loadVaultSecrets();
-loadVaultDataStore();
-ensureRemoteStoresLoaded();
-
-setInterval(() =>
-{
-    const now = Date.now();
-    for (const [email, entry] of otpStore.entries())
-    {
-        if (entry.expiresAt < now) { otpStore.delete(email); }
-    }
-    let sessionsChanged = false;
-    for (const [token, session] of activeSessions.entries())
-    {
-        if (!session || session.expiresAt <= now || isTokenRevoked(token, session.jti || ''))
-        {
             activeSessions.delete(token);
-            sessionsChanged = true;
+            saveSessions();
+        }
+        return false;
+    }
+
+
+    function isTokenRevoked(token, jti = '') {
+        if (!token || typeof token !== 'string') { return true; }
+        const now = Date.now();
+        const tokenHash = sha256(token);
+        const exp = revokedTokens.get(tokenHash);
+        if (exp && exp > now) { return true; }
+        if (jti) {
+            const jtiExp = revokedTokens.get(`jti:${jti}`);
+            if (jtiExp && jtiExp > now) { return true; }
+        }
+        return false;
+    }
+
+    // HTTPヘッダーからBearerトークンを安全抽出
+    function extractBearerToken(req) {
+        const authHeader = req.headers['authorization'] || '';
+        if (authHeader.startsWith('Bearer ')) {
+            return authHeader.slice(7).trim();
+        }
+        return '';
+    }
+
+    function loadOfflineQueue() {
+        try {
+            const obj = readEncryptedJsonFile(QUEUE_FILE_PATH);
+            if (!obj) { return; }
+            for (const [userId, messages] of Object.entries(obj)) {
+                if (Array.isArray(messages) && messages.length > 0) {
+                    offlineMessageQueue.set(userId, messages);
+                }
+            }
+            console.log(`[Offline Queue] ${offlineMessageQueue.size} ユーザー分のキューを復元完了`);
+        }
+        catch (err) {
+            console.error('[Offline Queue Load Error]', err.message);
         }
     }
-    if (sessionsChanged) { saveSessions(); }
 
-    let revokedChanged = false;
-    for (const [k, exp] of revokedTokens.entries())
-    {
-        if (!exp || exp <= now)
-        {
-            revokedTokens.delete(k);
-            revokedChanged = true;
+    let saveQueueTimer = null;
+    function saveOfflineQueue() {
+        if (saveQueueTimer) { clearTimeout(saveQueueTimer); }
+        saveQueueTimer = setTimeout(() => {
+            const obj = {};
+            for (const [userId, messages] of offlineMessageQueue.entries()) {
+                if (messages && messages.length > 0) { obj[userId] = messages; }
+            }
+            writeEncryptedJsonFile(QUEUE_FILE_PATH, obj);
+        }, 200);
+    }
+
+
+    // VULN-34是正: 添付ファイルACLの暗号化永続化保存・復元
+    function saveAttachmentAcls() {
+        const obj = {};
+        for (const [k, v] of attachmentAclStore.entries()) {
+            obj[k] = v;
+        }
+        writeEncryptedJsonFile(ATTACHMENT_ACLS_FILE, obj);
+    }
+
+    function loadAttachmentAcls() {
+        try {
+            const obj = readEncryptedJsonFile(ATTACHMENT_ACLS_FILE);
+            if (!obj) { return; }
+            for (const [k, v] of Object.entries(obj)) {
+                if (v && v.uploaderUid) {
+                    attachmentAclStore.set(k, v);
+                }
+            }
+            console.log(`[Attachment ACL Store] ${attachmentAclStore.size} 件のファイル認可情報を復元完了`);
+        }
+        catch (e) {
+            console.error('[Attachment ACL Store] 復元エラー:', e.message);
         }
     }
-    if (revokedChanged) { saveRevokedTokens(); }
 
-    for (const [ip, rec] of ipConnectionTracker.entries())
-    {
-        if (!rec || rec.resetTime < now) { ipConnectionTracker.delete(ip); }
+    function saveFcmTokens() {
+        const obj = {};
+        for (const [k, v] of fcmTokenStore.entries()) { obj[k] = v; }
+        writeEncryptedJsonFile(FCM_TOKENS_FILE, obj);
     }
-    for (const [pktKey, ts] of recentChatPacketIds.entries())
-    {
-        if (now - ts > 120000) { recentChatPacketIds.delete(pktKey); }
+
+    function loadFcmTokens() {
+        try {
+            const obj = readEncryptedStoreWithLegacyFallback(FCM_TOKENS_FILE, LEGACY_FCM_TOKENS_FILE);
+            if (!obj) { return; }
+            for (const [k, v] of Object.entries(obj)) { fcmTokenStore.set(k, v); }
+            console.log(`[FCM Store] ${fcmTokenStore.size} 件のFCMトークンを復元完了`);
+        }
+        catch (e) {
+            console.error('[FCM Store] トークン復元エラー:', e.message);
+        }
     }
-}, 60000);
 
-module.exports = {
-    SERVER_DIR,
-    ALLOWED_EMAIL_HASHES,
-    APPROVAL_ROUTING,
-    SESSION_DURATION_MS,
-    fcmTokenStore,
-    ipConnectionTracker,
-    otpStore,
-    activeSessions,
-    revokedTokens,
-    seenInviteNonces,
-    emailOtpCooldownTracker,
-    offlineMessageQueue,
-    offlineReadQueue,
-    attachmentAclStore,
-    recentChatPacketIds,
-    rooms,
-    users,
-    wsIpConnectionCount,
-    enforceMapSizeCap,
-    maskEmail,
-    sha256,
-    saveSessions,
-    revokeSessionToken,
-    isTokenRevoked,
-    createStatelessSessionToken,
-    verifyAndRestoreStatelessToken,
-    isValidSession,
-    extractBearerToken,
-    saveOfflineQueue,
-    saveFcmTokens,
-    saveOfflineReads,
-    saveAttachmentAcls,
-    profileStore,
-    saveProfiles,
-    loadProfiles,
-    phoneStore,
-    deviceStore: phoneStore,
-    savePhoneStore,
-    saveDeviceStore: savePhoneStore,
-    loadPhoneStore,
-    vaultSecretsStore,
-    vaultDataStore,
-    saveVaultDataStore,
-    getOrCreateVaultSecretB64,
-    ensureRemoteStoresLoaded,
-    isSupabaseServiceReady,
-    supabaseServiceUpsert,
-    supabaseServiceSelect,
-    supabaseServiceScrub,
-    parseJsonBody,
-    flushAllStoresSync
-};
+    function saveOfflineReads() {
+        const obj = {};
+        for (const [k, v] of offlineReadQueue.entries()) { obj[k] = v; }
+        writeEncryptedJsonFile(OFFLINE_READS_FILE, obj);
+    }
 
-return module.exports;
+    function loadOfflineReads() {
+        try {
+            const obj = readEncryptedStoreWithLegacyFallback(OFFLINE_READS_FILE, LEGACY_OFFLINE_READS_FILE);
+            if (!obj) { return; }
+            for (const [k, v] of Object.entries(obj)) { offlineReadQueue.set(k, v); }
+            console.log(`[Offline Read Store] ${offlineReadQueue.size} ユーザーの通知を復元完了`);
+        }
+        catch (e) {
+            console.error('[Offline Read Store] 復元エラー:', e.message);
+        }
+    }
+
+    // 既読通知キュー追加の共通ヘルパー (SEC-05: Map上限保護と300件上限をHTTP/WS間で統一)
+    function enqueueOfflineRead(fromUserId, targetUserId, messageIds) {
+        if (!offlineReadQueue.has(targetUserId)) {
+            enforceMapSizeCap(offlineReadQueue, 500);
+            offlineReadQueue.set(targetUserId, []);
+        }
+        const rq = offlineReadQueue.get(targetUserId);
+        if (rq.length >= 300) { return { queued: false, size: rq.length }; }
+        rq.push({
+            fromUserId: fromUserId,
+            targetUserId: targetUserId,
+            messageIds: messageIds,
+            timestamp: Date.now()
+        });
+        saveOfflineReads();
+        return { queued: true, size: rq.length };
+    }
+
+    // チャット送信レートリミット共通判定 (HTTP/WS共通でUID毎最大30件/秒)
+    function isChatSendRateLimited(fromUserId) {
+        const nowTime = Date.now();
+        const rateRecord = chatSendRateLimitMap.get(fromUserId) || { count: 0, resetAt: nowTime + 1000 };
+        if (nowTime > rateRecord.resetAt) {
+            rateRecord.count = 1;
+            rateRecord.resetAt = nowTime + 1000;
+        }
+        else {
+            rateRecord.count++;
+            if (rateRecord.count > 30) { return true; }
+        }
+        enforceMapSizeCap(chatSendRateLimitMap, 2000);
+        chatSendRateLimitMap.set(fromUserId, rateRecord);
+        return false;
+    }
+
+    // JSONリクエストボディの取得ヘルパー (最大5MB上限: OOM DoS完全防御)
+    function parseJsonBody(req, maxBytes = 5 * 1024 * 1024) {
+        return new Promise((resolve, reject) => {
+            let body = '';
+            let received = 0;
+            req.on('data', chunk => {
+                received += chunk.length;
+                if (received > maxBytes) {
+                    req.destroy();
+                    return reject(new Error('Payload Too Large: JSONボディが上限(5MB)を超過しました'));
+                }
+                body += chunk;
+            });
+            req.on('end', () => {
+                try {
+                    resolve(body ? JSON.parse(body) : {});
+                }
+                catch (err) {
+                    reject(err);
+                }
+            });
+            req.on('error', reject);
+        });
+    }
+
+    // グレースフルシャットダウン用同期フラッシュ
+    function flushAllStoresSync() {
+        try {
+            if (saveQueueTimer) {
+                clearTimeout(saveQueueTimer);
+                saveQueueTimer = null;
+            }
+            const queueObj = {};
+            for (const [userId, messages] of offlineMessageQueue.entries()) {
+                if (messages && messages.length > 0) { queueObj[userId] = messages; }
+            }
+            writeEncryptedJsonFile(QUEUE_FILE_PATH, queueObj);
+            saveSessions();
+            saveRevokedTokens();
+            saveFcmTokens();
+            saveOfflineReads();
+            saveAttachmentAcls();
+            saveProfiles();
+            savePhoneStore();
+            saveVaultSecrets();
+            saveVaultDataStore();
+            console.log('[Graceful Shutdown] 全永続化ストアの暗号化同期保存が完了しました');
+        }
+        catch (e) {
+            console.error('[Graceful Shutdown Error]', e.message);
+        }
+    }
+
+    // 起動時ロードと定期クリーンアップ開始
+    loadRevokedTokens();
+    loadSessions();
+    loadOfflineQueue();
+    loadFcmTokens();
+    loadOfflineReads();
+    loadAttachmentAcls();
+    loadProfiles();
+    loadPhoneStore();
+    loadVaultSecrets();
+    loadVaultDataStore();
+    ensureRemoteStoresLoaded();
+
+    setInterval(() => {
+        const now = Date.now();
+        for (const [email, entry] of otpStore.entries()) {
+            if (entry.expiresAt < now) { otpStore.delete(email); }
+        }
+        let sessionsChanged = false;
+        for (const [token, session] of activeSessions.entries()) {
+            if (!session || session.expiresAt <= now || isTokenRevoked(token, session.jti || '')) {
+                activeSessions.delete(token);
+                sessionsChanged = true;
+            }
+        }
+        if (sessionsChanged) { saveSessions(); }
+
+        let revokedChanged = false;
+        for (const [k, exp] of revokedTokens.entries()) {
+            if (!exp || exp <= now) {
+                revokedTokens.delete(k);
+                revokedChanged = true;
+            }
+        }
+        if (revokedChanged) { saveRevokedTokens(); }
+
+        for (const [ip, rec] of ipConnectionTracker.entries()) {
+            if (!rec || rec.resetTime < now) { ipConnectionTracker.delete(ip); }
+        }
+        for (const [pktKey, ts] of recentChatPacketIds.entries()) {
+            if (now - ts > 120000) { recentChatPacketIds.delete(pktKey); }
+        }
+    }, 60000);
+
+    module.exports = {
+        SERVER_DIR,
+        ALLOWED_EMAIL_HASHES,
+        APPROVAL_ROUTING,
+        SESSION_DURATION_MS,
+        fcmTokenStore,
+        ipConnectionTracker,
+        otpStore,
+        activeSessions,
+        revokedTokens,
+        seenInviteNonces,
+        emailOtpCooldownTracker,
+        offlineMessageQueue,
+        offlineReadQueue,
+        attachmentAclStore,
+        recentChatPacketIds,
+        rooms,
+        users,
+        wsIpConnectionCount,
+        enforceMapSizeCap,
+        isValidUidFormat,
+        maskEmail,
+        sha256,
+        saveSessions,
+        revokeSessionToken,
+        extractTokenJti,
+        isTokenRevoked,
+        createStatelessSessionToken,
+        verifyAndRestoreStatelessToken,
+        isValidSession,
+        extractBearerToken,
+        saveOfflineQueue,
+        saveFcmTokens,
+        saveOfflineReads,
+        enqueueOfflineRead,
+        isChatSendRateLimited,
+        saveAttachmentAcls,
+        profileStore,
+        saveProfiles,
+        loadProfiles,
+        phoneStore,
+        deviceStore: phoneStore,
+        savePhoneStore,
+        saveDeviceStore: savePhoneStore,
+        loadPhoneStore,
+        vaultSecretsStore,
+        vaultDataStore,
+        saveVaultDataStore,
+        getOrCreateVaultSecretB64,
+        ensureRemoteStoresLoaded,
+        isSupabaseServiceReady,
+        supabaseServiceUpsert,
+        supabaseServiceSelect,
+        supabaseServiceScrub,
+        parseJsonBody,
+        flushAllStoresSync
+    };
+
+    return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Module: ./modules/pushAndMail.js] ====================
-__internalModules['./modules/pushAndMail'] = (function(module, exports) {
-// 変更日時：2026年11月05日 22時50分
-// [サーバーモジュール] Firebase Admin FCMプッシュ送信 ＆ OTP認証メール送信 (GAS / SMTP)
+__internalModules['./modules/pushAndMail'] = (function (module, exports) {
+    // 変更日時：2026年11月05日 22時50分
+    // [サーバーモジュール] Firebase Admin FCMプッシュ送信 ＆ OTP認証メール送信 (GAS / SMTP)
 
-const https = require('https');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const { SERVER_DIR } = __requireModule('./modules/stateStore');
+    const https = require('https');
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const path = require('path');
+    const { SERVER_DIR } = __requireModule('./modules/stateStore');
 
-let admin = null;
-let firebaseApp = null;
-try
-{
-    admin = require('firebase-admin');
-    // VULN-38是正: ローカルファイル依存を完全撤廃し、環境変数 FIREBASE_SERVICE_ACCOUNT に一本化
-    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
-        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-        : null;
+    let admin = null;
+    let firebaseApp = null;
+    try {
+        admin = require('firebase-admin');
+        // VULN-38是正: ローカルファイル依存を完全撤廃し、環境変数 FIREBASE_SERVICE_ACCOUNT に一本化
+        const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+            ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+            : null;
 
-    if (serviceAccount && admin)
-    {
-        firebaseApp = admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log('[Firebase Admin] FCM プッシュ送信機能の初期化完了');
-    }
-}
-catch (e)
-{
-    console.warn('[Firebase Admin Note] 初期化スキップまたは保留:', e.message);
-}
-
-let nodemailer = null;
-try
-{
-    nodemailer = require('nodemailer');
-}
-catch (e)
-{
-    // nodemailer未導入時の安全フォールバック
-}
-
-// メールトランスポーターの初期化 (Gmail アプリパスワード連携)
-function createMailTransporter()
-{
-    const user = process.env.GMAIL_USER;
-    const pass = process.env.GMAIL_APP_PASS;
-    if (!user || !pass || !nodemailer)
-    {
-        return null;
-    }
-    return nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 465,
-        secure: true,
-        auth: { user, pass },
-        family: 4,
-        connectionTimeout: 8000,
-        greetingTimeout: 5000,
-        socketTimeout: 10000
-    });
-}
-
-// GAS (Google Apps Script) WebHook 経由でのメール送信 (Port 443 HTTPS通信: Render無料枠対応)
-function sendMailViaGas(gasUrl, mailData)
-{
-    return new Promise((resolve, reject) =>
-    {
-        const postData = JSON.stringify(mailData);
-        const parsedUrl = new URL(gasUrl);
-
-        const options = {
-            hostname: parsedUrl.hostname,
-            path: parsedUrl.pathname + parsedUrl.search,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-            },
-            timeout: 15000
-        };
-
-        const req = https.request(options, (res) =>
-        {
-            if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307)
-            {
-                const redirectUrl = res.headers.location;
-                if (!redirectUrl)
-                {
-                    return resolve({ success: true, redirected: true });
-                }
-                https.get(redirectUrl, (redirectRes) =>
-                {
-                    let body = '';
-                    redirectRes.on('data', chunk => { body += chunk; });
-                    redirectRes.on('end', () =>
-                    {
-                        try
-                        {
-                            resolve(JSON.parse(body));
-                        }
-                        catch (e)
-                        {
-                            resolve({ success: true, raw: body });
-                        }
-                    });
-                }).on('error', (err) =>
-                {
-                    console.warn('[GAS Redirect Note]', err.message);
-                    resolve({ success: true });
-                });
-                return;
-            }
-
-            let body = '';
-            res.on('data', chunk => { body += chunk; });
-            res.on('end', () =>
-            {
-                try
-                {
-                    resolve(JSON.parse(body));
-                }
-                catch (e)
-                {
-                    resolve({ success: res.statusCode >= 200 && res.statusCode < 300, raw: body });
-                }
+        if (serviceAccount && admin) {
+            firebaseApp = admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount)
             });
+            console.log('[Firebase Admin] FCM プッシュ送信機能の初期化完了');
+        }
+    }
+    catch (e) {
+        console.warn('[Firebase Admin Note] 初期化スキップまたは保留:', e.message);
+    }
+
+    let nodemailer = null;
+    try {
+        nodemailer = require('nodemailer');
+    }
+    catch (e) {
+        // nodemailer未導入時の安全フォールバック
+    }
+
+    // メールトランスポーターの初期化 (Gmail アプリパスワード連携)
+    function createMailTransporter() {
+        const user = process.env.GMAIL_USER;
+        const pass = process.env.GMAIL_APP_PASS;
+        if (!user || !pass || !nodemailer) {
+            return null;
+        }
+        return nodemailer.createTransport({
+            host: 'smtp.gmail.com',
+            port: 465,
+            secure: true,
+            auth: { user, pass },
+            family: 4,
+            connectionTimeout: 8000,
+            greetingTimeout: 5000,
+            socketTimeout: 10000
         });
+    }
 
-        req.on('timeout', () =>
-        {
-            req.destroy();
-            reject(new Error('GASメール送信接続タイムアウト'));
+    // GAS (Google Apps Script) WebHook 経由でのメール送信 (Port 443 HTTPS通信: Render無料枠対応)
+    function sendMailViaGas(gasUrl, mailData) {
+        return new Promise((resolve, reject) => {
+            const postData = JSON.stringify(mailData);
+            const parsedUrl = new URL(gasUrl);
+
+            const options = {
+                hostname: parsedUrl.hostname,
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                },
+                timeout: 15000
+            };
+
+            const req = https.request(options, (res) => {
+                if (res.statusCode === 302 || res.statusCode === 301 || res.statusCode === 307) {
+                    const redirectUrl = res.headers.location;
+                    if (!redirectUrl) {
+                        return resolve({ success: true, redirected: true });
+                    }
+                    https.get(redirectUrl, (redirectRes) => {
+                        let body = '';
+                        redirectRes.on('data', chunk => { body += chunk; });
+                        redirectRes.on('end', () => {
+                            try {
+                                resolve(JSON.parse(body));
+                            }
+                            catch (e) {
+                                resolve({ success: true, raw: body });
+                            }
+                        });
+                    }).on('error', (err) => {
+                        console.warn('[GAS Redirect Note]', err.message);
+                        resolve({ success: true });
+                    });
+                    return;
+                }
+
+                let body = '';
+                res.on('data', chunk => { body += chunk; });
+                res.on('end', () => {
+                    try {
+                        resolve(JSON.parse(body));
+                    }
+                    catch (e) {
+                        resolve({ success: res.statusCode >= 200 && res.statusCode < 300, raw: body });
+                    }
+                });
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error('GASメール送信接続タイムアウト'));
+            });
+
+            req.on('error', reject);
+            req.write(postData);
+            req.end();
         });
+    }
 
-        req.on('error', reject);
-        req.write(postData);
-        req.end();
-    });
-}
+    // FCM高優先度着信データプッシュ送信
+    async function sendIncomingCallPush(targetFcmToken, callData) {
+        if (!firebaseApp || !admin) {
+            console.warn('[FCM Push Warning] Firebase Admin未初期化のため着信プッシュをスキップ');
+            return false;
+        }
+        if (!targetFcmToken) {
+            console.warn('[FCM Push Warning] 宛先FCMトークン未登録のため着信プッシュ送信不可');
+            return false;
+        }
+        try {
+            const message = {
+                token: targetFcmToken,
+                data: {
+                    type: 'incoming_call',
+                    fromUserId: String(callData.fromUserId || ''),
+                    fromName: String(callData.fromName || '通話相手'),
+                    roomId: String(callData.roomId || ''),
+                    isVideo: String(callData.isVideo ? 'true' : 'false'),
+                    timestamp: String(Date.now()),
+                    nonce: crypto.randomBytes(8).toString('hex')
+                },
+                android: {
+                    priority: 'high',
+                    ttl: 60 * 1000
+                }
+            };
 
-// FCM高優先度着信データプッシュ送信
-async function sendIncomingCallPush(targetFcmToken, callData)
-{
-    if (!firebaseApp || !admin)
-    {
-        console.warn('[FCM Push Warning] Firebase Admin未初期化のため着信プッシュをスキップ');
-        return false;
+            const response = await admin.messaging().send(message);
+            console.log(`[FCM Push] 着信データプッシュ送信完了 (${callData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+            return true;
+        }
+        catch (err) {
+            console.error('[FCM Push Error] プッシュ送信失敗:', err.message);
+            return false;
+        }
     }
-    if (!targetFcmToken)
-    {
-        console.warn('[FCM Push Warning] 宛先FCMトークン未登録のため着信プッシュ送信不可');
-        return false;
-    }
-    try
-    {
-        const message = {
-            token: targetFcmToken,
-            data: {
-                type: 'incoming_call',
-                fromUserId: String(callData.fromUserId || ''),
-                fromName: String(callData.fromName || '通話相手'),
-                roomId: String(callData.roomId || ''),
-                isVideo: String(callData.isVideo ? 'true' : 'false'),
-                timestamp: String(Date.now()),
-                nonce: crypto.randomBytes(8).toString('hex')
-            },
-            android: {
-                priority: 'high',
-                ttl: 60 * 1000
-            }
-        };
 
-        const response = await admin.messaging().send(message);
-        console.log(`[FCM Push] 着信データプッシュ送信完了 (${callData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
-        return true;
-    }
-    catch (err)
-    {
-        console.error('[FCM Push Error] プッシュ送信失敗:', err.message);
-        return false;
-    }
-}
+    // FCM新着チャットプッシュ送信 (dataメッセージ統一・暗号化本文＆添付ファイル情報を完全伝送)
+    async function sendChatMessagePush(targetFcmToken, chatData) {
+        if (!firebaseApp || !admin) {
+            console.warn('[FCM Chat Push Warning] Firebase Admin未初期化のためチャットプッシュをスキップ');
+            return false;
+        }
+        if (!targetFcmToken) {
+            console.warn('[FCM Chat Push Warning] 宛先FCMトークン未登録のためチャットプッシュ送信不可');
+            return false;
+        }
+        try {
+            const message = {
+                token: targetFcmToken,
+                data: {
+                    type: 'chat_message',
+                    subType: String(chatData.subType || ''),
+                    targetMessageId: String(chatData.targetMessageId || ''),
+                    fromUserId: String(chatData.fromUserId || ''),
+                    fromName: String(chatData.fromName || '友だち'),
+                    messageId: String(chatData.messageId || ''),
+                    text: String(chatData.text || ''),
+                    iv: String(chatData.iv || ''),
+                    cipher: String(chatData.cipher || ''),
+                    // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
+                    hasImage: String(chatData.hasImage === 'true' || !!chatData.imageBase64 ? 'true' : 'false'),
+                    fileUrl: String(chatData.fileUrl || ''),
+                    // VULN-21是正: 添付ファイル復号鍵(fileKey)を平文プッシュ伝送から完全排除（E2EEペイロード内のみで安全に伝送）
+                    fileKey: '',
+                    fileName: String(chatData.fileName || ''),
+                    fileSize: String(chatData.fileSize || '0'),
+                    senderPubKey: String(chatData.senderPubKey || ''),
+                    // VULN-24是正: 電子署名(senderPubSig)を正しく伝送し、FCMプッシュ経由での鍵検証を可能にする
+                    senderPubSig: String(chatData.senderPubSig || ''),
+                    timestamp: String(chatData.timestamp || Date.now())
+                },
+                android: {
+                    priority: 'high',
+                    ttl: 7 * 24 * 60 * 60 * 1000
+                }
+            };
 
-// FCM新着チャットプッシュ送信 (dataメッセージ統一・暗号化本文＆添付ファイル情報を完全伝送)
-async function sendChatMessagePush(targetFcmToken, chatData)
-{
-    if (!firebaseApp || !admin)
-    {
-        console.warn('[FCM Chat Push Warning] Firebase Admin未初期化のためチャットプッシュをスキップ');
-        return false;
+            const response = await admin.messaging().send(message);
+            console.log(`[FCM Chat Push] 新着チャットデータプッシュ送信完了 (${chatData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
+            return true;
+        }
+        catch (err) {
+            console.error('[FCM Chat Push Error] チャットプッシュ送信失敗:', err.message);
+            return false;
+        }
     }
-    if (!targetFcmToken)
-    {
-        console.warn('[FCM Chat Push Warning] 宛先FCMトークン未登録のためチャットプッシュ送信不可');
-        return false;
-    }
-    try
-    {
-        const message = {
-            token: targetFcmToken,
-            data: {
-                type: 'chat_message',
-                subType: String(chatData.subType || ''),
-                targetMessageId: String(chatData.targetMessageId || ''),
-                fromUserId: String(chatData.fromUserId || ''),
-                fromName: String(chatData.fromName || '友だち'),
-                messageId: String(chatData.messageId || ''),
-                text: String(chatData.text || ''),
-                iv: String(chatData.iv || ''),
-                cipher: String(chatData.cipher || ''),
-                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
-                hasImage: String(chatData.hasImage === 'true' || !!chatData.imageBase64 ? 'true' : 'false'),
-                fileUrl: String(chatData.fileUrl || ''),
-                // VULN-21是正: 添付ファイル復号鍵(fileKey)を平文プッシュ伝送から完全排除（E2EEペイロード内のみで安全に伝送）
-                fileKey: '',
-                fileName: String(chatData.fileName || ''),
-                fileSize: String(chatData.fileSize || '0'),
-                senderPubKey: String(chatData.senderPubKey || ''),
-                // VULN-24是正: 電子署名(senderPubSig)を正しく伝送し、FCMプッシュ経由での鍵検証を可能にする
-                senderPubSig: String(chatData.senderPubSig || ''),
-                timestamp: String(chatData.timestamp || Date.now())
-            },
-            android: {
-                priority: 'high',
-                ttl: 7 * 24 * 60 * 60 * 1000
-            }
-        };
 
-        const response = await admin.messaging().send(message);
-        console.log(`[FCM Chat Push] 新着チャットデータプッシュ送信完了 (${chatData.fromName} -> Token: ${targetFcmToken.slice(0, 15)}...): ${response}`);
-        return true;
-    }
-    catch (err)
-    {
-        console.error('[FCM Chat Push Error] チャットプッシュ送信失敗:', err.message);
-        return false;
-    }
-}
+    module.exports = {
+        createMailTransporter,
+        sendMailViaGas,
+        sendIncomingCallPush,
+        sendChatMessagePush
+    };
 
-module.exports = {
-    createMailTransporter,
-    sendMailViaGas,
-    sendIncomingCallPush,
-    sendChatMessagePush
-};
-
-return module.exports;
+    return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Module: ./modules/httpAuthRoutes.js] ====================
-__internalModules['./modules/httpAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月14日 19時18分
-// [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
+__internalModules['./modules/httpAuthRoutes'] = (function (module, exports) {
+    // 変更日時：2026年11月16日 12時46分
+    // [サーバーモジュール] 二段階認証OTP・セッション管理・FCMデバイストークン登録HTTPルート
 
-const crypto = require('crypto');
-const {
-    ALLOWED_EMAIL_HASHES,
-    APPROVAL_ROUTING,
-    SESSION_DURATION_MS,
-    phoneStore,
-    savePhoneStore,
-    ensureRemoteStoresLoaded,
-    fcmTokenStore,
-    otpStore,
-    activeSessions,
-    seenInviteNonces,
-    emailOtpCooldownTracker,
-    enforceMapSizeCap,
-    maskEmail,
-    sha256,
-    saveSessions,
-    revokeSessionToken,
-    isTokenRevoked,
-    createStatelessSessionToken,
-    verifyAndRestoreStatelessToken,
-    isValidSession,
-    extractBearerToken,
-    saveFcmTokens,
-    parseJsonBody
-} = __requireModule('./modules/stateStore');
-const { createMailTransporter, sendMailViaGas } = __requireModule('./modules/pushAndMail');
+    const crypto = require('crypto');
+    const {
+        ALLOWED_EMAIL_HASHES,
+        APPROVAL_ROUTING,
+        SESSION_DURATION_MS,
+        phoneStore,
+        savePhoneStore,
+        ensureRemoteStoresLoaded,
+        fcmTokenStore,
+        otpStore,
+        activeSessions,
+        seenInviteNonces,
+        emailOtpCooldownTracker,
+        enforceMapSizeCap,
+        isValidUidFormat,
+        maskEmail,
+        sha256,
+        saveSessions,
+        revokeSessionToken,
+        isTokenRevoked,
+        createStatelessSessionToken,
+        verifyAndRestoreStatelessToken,
+        isValidSession,
+        extractBearerToken,
+        saveFcmTokens,
+        parseJsonBody
+    } = __requireModule('./modules/stateStore');
+    const { createMailTransporter, sendMailViaGas } = __requireModule('./modules/pushAndMail');
 
-const DEFAULT_FALLBACK_GOOGLE_CLIENT_ID = '450002782155-c9n0242g8rt89025gjjpvpleps61puo8.apps.googleusercontent.com';
-let cachedGoogleJwks = null;
-let cachedGoogleJwksExpiresAt = 0;
+    const DEFAULT_FALLBACK_GOOGLE_CLIENT_ID = '450002782155-c9n0242g8rt89025gjjpvpleps61puo8.apps.googleusercontent.com';
+    let cachedGoogleJwks = null;
+    let cachedGoogleJwksExpiresAt = 0;
 
-// 環境変数 GOOGLE_WEB_CLIENT_IDS / GOOGLE_WEB_CLIENT_ID から許可クライアントID一覧を取得
-function getAllowedGoogleClientIds()
-{
-    const raw = (process.env.GOOGLE_WEB_CLIENT_IDS || process.env.GOOGLE_WEB_CLIENT_ID || '').trim();
-    if (!raw) { return [DEFAULT_FALLBACK_GOOGLE_CLIENT_ID]; }
-    return raw.split(',').map(s => s.trim()).filter(Boolean);
-}
+    // 環境変数 GOOGLE_WEB_CLIENT_IDS / GOOGLE_WEB_CLIENT_ID から許可クライアントID一覧を取得
+    function getAllowedGoogleClientIds() {
+        const raw = (process.env.GOOGLE_WEB_CLIENT_IDS || process.env.GOOGLE_WEB_CLIENT_ID || '').trim();
+        if (!raw) { return [DEFAULT_FALLBACK_GOOGLE_CLIENT_ID]; }
+        return raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
 
-// Google OAuth2 JWKS公開鍵のキャッシュ取得
-async function fetchGoogleJwks(forceRefresh = false)
-{
-    const now = Date.now();
-    if (!forceRefresh && cachedGoogleJwks && now < cachedGoogleJwksExpiresAt)
-    {
+    // Google OAuth2 JWKS公開鍵のキャッシュ取得
+    async function fetchGoogleJwks(forceRefresh = false) {
+        const now = Date.now();
+        if (!forceRefresh && cachedGoogleJwks && now < cachedGoogleJwksExpiresAt) {
+            return cachedGoogleJwks;
+        }
+        const resp = await fetch('https://www.googleapis.com/oauth2/v3/certs');
+        if (!resp.ok) { return null; }
+        const data = await resp.json();
+        if (!data || !Array.isArray(data.keys)) { return null; }
+        cachedGoogleJwks = data.keys;
+        cachedGoogleJwksExpiresAt = now + 60 * 60 * 1000;
         return cachedGoogleJwks;
     }
-    const resp = await fetch('https://www.googleapis.com/oauth2/v3/certs');
-    if (!resp.ok) { return null; }
-    const data = await resp.json();
-    if (!data || !Array.isArray(data.keys)) { return null; }
-    cachedGoogleJwks = data.keys;
-    cachedGoogleJwksExpiresAt = now + 60 * 60 * 1000;
-    return cachedGoogleJwks;
-}
 
-// Google IDトークンのクレーム共通検証
-function validateGoogleClaims(payload, expectedEmail, requireIssuer)
-{
-    if (!payload || typeof payload !== 'object') { return false; }
-    const iss = String(payload.iss || '');
-    if (requireIssuer && iss !== 'accounts.google.com' && iss !== 'https://accounts.google.com')
-    {
-        return false;
-    }
-    const expMs = Number(payload.exp || 0) * 1000;
-    if (!expMs || expMs <= Date.now() - 30000) { return false; }
-    const allowedIds = getAllowedGoogleClientIds();
-    const aud = String(payload.aud || '').trim();
-    if (!aud || !allowedIds.includes(aud)) { return false; }
-    const verified = payload.email_verified === true || payload.email_verified === 'true';
-    if (!verified) { return false; }
-    const tokenEmail = String(payload.email || '').trim().toLowerCase();
-    return Boolean(tokenEmail && tokenEmail === expectedEmail);
-}
-
-// Google IDトークンの暗号署名＆クレーム検証 (JWKS優先・失敗時tokeninfoフォールバック)
-async function verifyGoogleIdToken(idToken, expectedEmail)
-{
-    const cleanToken = (idToken || '').trim();
-    const cleanEmail = (expectedEmail || '').trim().toLowerCase();
-    if (!cleanToken || !cleanEmail || cleanToken.length > 8192) { return false; }
-
-    try
-    {
-        const parts = cleanToken.split('.');
-        if (parts.length !== 3) { return false; }
-        const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-        if (!header || header.alg !== 'RS256' || !header.kid) { return false; }
-
-        let keys = await fetchGoogleJwks(false);
-        let jwk = keys ? keys.find(k => k.kid === header.kid) : null;
-        if (!jwk)
-        {
-            keys = await fetchGoogleJwks(true);
-            jwk = keys ? keys.find(k => k.kid === header.kid) : null;
+    // Google IDトークンのクレーム共通検証
+    function validateGoogleClaims(payload, expectedEmail, requireIssuer) {
+        if (!payload || typeof payload !== 'object') { return false; }
+        const iss = String(payload.iss || '');
+        if (requireIssuer && iss !== 'accounts.google.com' && iss !== 'https://accounts.google.com') {
+            return false;
         }
-        if (jwk)
-        {
-            const pubKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
-            const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`, 'utf8');
-            const sigBuf = Buffer.from(parts[2], 'base64url');
-            const sigOk = crypto.verify('RSA-SHA256', signingInput, pubKey, sigBuf);
-            return sigOk && validateGoogleClaims(payload, cleanEmail, true);
+        const expMs = Number(payload.exp || 0) * 1000;
+        if (!expMs || expMs <= Date.now() - 30000) { return false; }
+        const allowedIds = getAllowedGoogleClientIds();
+        const aud = String(payload.aud || '').trim();
+        if (!aud || !allowedIds.includes(aud)) { return false; }
+        const verified = payload.email_verified === true || payload.email_verified === 'true';
+        if (!verified) { return false; }
+        const tokenEmail = String(payload.email || '').trim().toLowerCase();
+        return Boolean(tokenEmail && tokenEmail === expectedEmail);
+    }
+
+    // Google IDトークンの暗号署名＆クレーム検証 (JWKS優先・失敗時tokeninfoフォールバック)
+    async function verifyGoogleIdToken(idToken, expectedEmail) {
+        const cleanToken = (idToken || '').trim();
+        const cleanEmail = (expectedEmail || '').trim().toLowerCase();
+        if (!cleanToken || !cleanEmail || cleanToken.length > 8192) { return false; }
+
+        try {
+            const parts = cleanToken.split('.');
+            if (parts.length !== 3) { return false; }
+            const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+            const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            if (!header || header.alg !== 'RS256' || !header.kid) { return false; }
+
+            let keys = await fetchGoogleJwks(false);
+            let jwk = keys ? keys.find(k => k.kid === header.kid) : null;
+            if (!jwk) {
+                keys = await fetchGoogleJwks(true);
+                jwk = keys ? keys.find(k => k.kid === header.kid) : null;
+            }
+            if (jwk) {
+                const pubKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+                const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`, 'utf8');
+                const sigBuf = Buffer.from(parts[2], 'base64url');
+                const sigOk = crypto.verify('RSA-SHA256', signingInput, pubKey, sigBuf);
+                return sigOk && validateGoogleClaims(payload, cleanEmail, true);
+            }
+        }
+        catch (jwksErr) {
+            console.warn('[Google Auth] JWKS検証スキップ:', jwksErr.message);
+        }
+
+        try {
+            const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(cleanToken)}`);
+            if (!resp.ok) { return false; }
+            const info = await resp.json();
+            return validateGoogleClaims(info, cleanEmail, false);
+        }
+        catch (infoErr) {
+            console.warn('[Google Auth] tokeninfo検証失敗:', infoErr.message);
+            return false;
         }
     }
-    catch (jwksErr)
-    {
-        console.warn('[Google Auth] JWKS検証スキップ:', jwksErr.message);
+
+    // メールアドレス・端末UIDに一致する有効セッション所持判定
+    function hasValidEmailSession(sessionToken, deviceUid, emailHash) {
+        if (!sessionToken || !isValidSession(sessionToken, deviceUid, false)) { return false; }
+        const sess = activeSessions.get(sessionToken) || verifyAndRestoreStatelessToken(sessionToken);
+        if (!sess) { return false; }
+        const sessEmailHash = sess.emailHash || sha256(sess.email || '');
+        return Boolean(sessEmailHash && sessEmailHash === emailHash);
     }
 
-    try
-    {
-        const resp = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(cleanToken)}`);
-        if (!resp.ok) { return false; }
-        const info = await resp.json();
-        return validateGoogleClaims(info, cleanEmail, false);
-    }
-    catch (infoErr)
-    {
-        console.warn('[Google Auth] tokeninfo検証失敗:', infoErr.message);
-        return false;
-    }
-}
+    // 認証およびFCM登録系HTTPエンドポイントの処理 (処理した場合は true を返す)
+    async function handleAuthRoutes(req, res, url) {
+        // [API 1] OTP送信: POST /api/auth/send-otp
+        if (req.method === 'POST' && url === '/api/auth/send-otp') {
+            try {
+                const body = await parseJsonBody(req);
+                const email = (body.email || '').trim().toLowerCase();
 
-// メールアドレス・端末UIDに一致する有効セッション所持判定
-function hasValidEmailSession(sessionToken, deviceUid, emailHash)
-{
-    if (!sessionToken || !isValidSession(sessionToken, deviceUid, false)) { return false; }
-    const sess = activeSessions.get(sessionToken) || verifyAndRestoreStatelessToken(sessionToken);
-    if (!sess) { return false; }
-    const sessEmailHash = sess.emailHash || sha256(sess.email || '');
-    return Boolean(sessEmailHash && sessEmailHash === emailHash);
-}
+                if (!email) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'メールアドレスが指定されていません' }));
+                    return true;
+                }
 
-// 認証およびFCM登録系HTTPエンドポイントの処理 (処理した場合は true を返す)
-async function handleAuthRoutes(req, res, url)
-{
-    // [API 1] OTP送信: POST /api/auth/send-otp
-    if (req.method === 'POST' && url === '/api/auth/send-otp')
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const email = (body.email || '').trim().toLowerCase();
+                const emailHash = sha256(email);
+                if (!ALLOWED_EMAIL_HASHES.has(emailHash)) {
+                    console.warn(`[Auth Warning] 未許可メールアドレスのOTP要求を遮断: ${maskEmail(email)}`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'このGoogleアカウントはアクセス許可リストに存在しません' }));
+                    return true;
+                }
 
-            if (!email)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'メールアドレスが指定されていません' }));
-                return true;
-            }
+                const now = Date.now();
+                const lastSent = emailOtpCooldownTracker.get(email) || 0;
+                if (now - lastSent < 60000) {
+                    const remainSec = Math.ceil((60000 - (now - lastSent)) / 1000);
+                    res.writeHead(429, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: `認証コードは送信済みです。再送信まであと ${remainSec} 秒お待ちください` }));
+                    return true;
+                }
+                enforceMapSizeCap(emailOtpCooldownTracker, 2000);
+                emailOtpCooldownTracker.set(email, now);
 
-            const emailHash = sha256(email);
-            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
-            {
-                console.warn(`[Auth Warning] 未許可メールアドレスのOTP要求を遮断: ${maskEmail(email)}`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'このGoogleアカウントはアクセス許可リストに存在しません' }));
-                return true;
-            }
+                const code = crypto.randomInt(100000, 1000000).toString();
+                const expiresAt = now + 5 * 60 * 1000;
+                enforceMapSizeCap(otpStore, 2000);
+                otpStore.set(email, { code, expiresAt, attempts: 0, lastSentAt: now });
 
-            const now = Date.now();
-            const lastSent = emailOtpCooldownTracker.get(email) || 0;
-            if (now - lastSent < 60000)
-            {
-                const remainSec = Math.ceil((60000 - (now - lastSent)) / 1000);
-                res.writeHead(429, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: `認証コードは送信済みです。再送信まであと ${remainSec} 秒お待ちください` }));
-                return true;
-            }
-            enforceMapSizeCap(emailOtpCooldownTracker, 2000);
-            emailOtpCooldownTracker.set(email, now);
+                const targetEmail = APPROVAL_ROUTING[email] || email;
+                const maskedTarget = maskEmail(targetEmail);
+                const maskedCode = `${code.slice(0, 2)}****`;
 
-            const code = crypto.randomInt(100000, 1000000).toString();
-            const expiresAt = now + 5 * 60 * 1000;
-            enforceMapSizeCap(otpStore, 2000);
-            otpStore.set(email, { code, expiresAt, attempts: 0, lastSentAt: now });
-
-            const targetEmail = APPROVAL_ROUTING[email] || email;
-            const maskedTarget = maskEmail(targetEmail);
-            const maskedCode = `${code.slice(0, 2)}****`;
-
-            console.log(`[Auth OTP] ログイン試行: ${maskEmail(email)} (相互承認) -> 送信先: ${maskedTarget} (${maskedCode})`);
+                console.log(`[Auth OTP] ログイン試行: ${maskEmail(email)} (相互承認) -> 送信先: ${maskedTarget} (${maskedCode})`);
 
 
-            const mailSubject = `【CellPhone App】${email} からのログイン承認要求`;
-            const mailText = `CellPhone App にて「${email}」がログインを試行しています。\n\n心当たりがある場合は、以下の6桁の承認コードをLINE等で相手にお伝えください。\n\n承認コード: ${code}\n\n※このコードの有効期限は5分間です。\n※心当たりのない場合は絶対に他人にコードを教えないでください。`;
-            const mailHtml = `
+                const mailSubject = `【CellPhone App】${email} からのログイン承認要求`;
+                const mailText = `CellPhone App にて「${email}」がログインを試行しています。\n\n心当たりがある場合は、以下の6桁の承認コードをLINE等で相手にお伝えください。\n\n承認コード: ${code}\n\n※このコードの有効期限は5分間です。\n※心当たりのない場合は絶対に他人にコードを教えないでください。`;
+                const mailHtml = `
                 <div style="font-family: sans-serif; max-width: 500px; padding: 20px; border: 1px solid #e0e0e0; border-radius: 8px;">
                     <h2 style="color: #3B82F6; margin-top: 0;">CellPhone App 相互承認要求</h2>
                     <p><strong>「${email}」</strong> がアプリへのサインインを試行しています。</p>
@@ -1562,302 +1456,407 @@ async function handleAuthRoutes(req, res, url)
                 </div>
             `;
 
-            const gasUrl = process.env.GAS_MAIL_URL;
-            if (gasUrl)
-            {
-                try
-                {
-                    console.log(`[GAS Mail] 送信開始: ${targetEmail} via ${gasUrl.slice(0, 45)}...`);
-                    await sendMailViaGas(gasUrl, {
+                const gasUrl = process.env.GAS_MAIL_URL;
+                if (gasUrl) {
+                    try {
+                        console.log(`[GAS Mail] 送信開始: ${maskedTarget} via ${gasUrl.slice(0, 45)}...`);
+                        await sendMailViaGas(gasUrl, {
+                            to: targetEmail,
+                            subject: mailSubject,
+                            text: mailText,
+                            html: mailHtml
+                        });
+                        console.log(`[GAS Mail] 送信成功: ${maskedTarget}`);
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({
+                            success: true,
+                            message: `承認コードを「${maskedTarget}」宛てに送信しました。\n相手の方からLINE等でコードを受け取ってください。`,
+                            targetNotice: maskedTarget
+                        }));
+                        return true;
+                    }
+                    catch (gasErr) {
+                        console.error('[GAS Mail Error]', gasErr);
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: 'メール送信処理に失敗しました。しばらく経ってから再試行してください' }));
+                        return true;
+                    }
+                }
+
+                const transporter = createMailTransporter();
+                if (transporter) {
+                    const mailOptions = {
+                        from: `"CellPhone App 相互承認" <${process.env.GMAIL_USER}>`,
                         to: targetEmail,
                         subject: mailSubject,
                         text: mailText,
                         html: mailHtml
-                    });
-                    console.log(`[GAS Mail] 送信成功: ${targetEmail}`);
+                    };
+
+                    await transporter.sendMail(mailOptions);
+                    console.log(`[Cross-Auth OTP Email] 送信完了: ${maskedTarget}`);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({
                         success: true,
                         message: `承認コードを「${maskedTarget}」宛てに送信しました。\n相手の方からLINE等でコードを受け取ってください。`,
                         targetNotice: maskedTarget
                     }));
-                    return true;
                 }
-                catch (gasErr)
-                {
-                    console.error('[GAS Mail Error]', gasErr);
+                else {
+                    console.error('[OTP Error] GMAIL_USER/GAS_MAIL_URL が未設定のため認証コードを送信できません');
                     res.writeHead(500, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: 'メール送信処理に失敗しました。しばらく経ってから再試行してください' }));
+                    res.end(JSON.stringify({
+                        success: false,
+                        error: 'メール送信設定が未構成のため認証コードを発行できません。管理者へお問い合わせください。'
+                    }));
+                }
+                return true;
+            }
+            catch (err) {
+                console.error('[OTP Send Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '認証コード送信中にエラーが発生しました' }));
+                return true;
+            }
+        }
+
+
+        // [API 2.2] 端末暗号鍵による自己完結・即時ログイン: POST /api/auth/verify-device-key
+        // SEC-01是正: 無条件TOFU・isSameDevice単独鍵上書きを廃止し、登録鍵一致・有効セッション・Google IDトークン検証のみ許可
+        if (req.method === 'POST' && url === '/api/auth/verify-device-key') {
+            try {
+                await ensureRemoteStoresLoaded();
+                const body = await parseJsonBody(req);
+                const email = (body.email || '').trim().toLowerCase();
+                const deviceUid = (body.deviceUid || '').trim();
+                const devicePubKey = (body.devicePubKey || '').trim();
+                const signature = (body.signature || '').trim();
+                const timestamp = Number(body.timestamp) || 0;
+                const nonce = (body.nonce || '').trim();
+                const idToken = (body.idToken || '').trim();
+                const incomingSessionToken = extractBearerToken(req) || (body.sessionToken || '').trim();
+
+                if (!email || !deviceUid || !devicePubKey || !signature || !timestamp || !nonce) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証パラメータが不足しています' }));
                     return true;
                 }
-            }
 
-            const transporter = createMailTransporter();
-            if (transporter)
-            {
-                const mailOptions = {
-                    from: `"CellPhone App 相互承認" <${process.env.GMAIL_USER}>`,
-                    to: targetEmail,
-                    subject: mailSubject,
-                    text: mailText,
-                    html: mailHtml
-                };
+                if (!/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
+                    return true;
+                }
 
-                await transporter.sendMail(mailOptions);
-                console.log(`[Cross-Auth OTP Email] 送信完了: ${targetEmail}`);
+                const emailHash = sha256(email);
+                if (!ALLOWED_EMAIL_HASHES.has(emailHash)) {
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アクセスが許可されていないアカウントです' }));
+                    return true;
+                }
+
+                // 鮮度検証 (60秒以内)
+                const now = Date.now();
+                if (Math.abs(now - timestamp) > 60000) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
+                    return true;
+                }
+
+                // Nonce形式検証 (VULN-242是正)
+                if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'Nonce形式が不正です' }));
+                    return true;
+                }
+
+                // Nonceリプレイ検証
+                if (seenInviteNonces.has(nonce)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
+                    return true;
+                }
+
+                // 1. 端末ハードウェアECDSA署名検証を最優先で実施
+                const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, '');
+                let verified = false;
+                try {
+                    const pem = `-----BEGIN PUBLIC KEY-----\n${incomingCleanPub}\n-----END PUBLIC KEY-----`;
+                    const sigData = `DEVICE_KEY_AUTH:${email}:${deviceUid}:${timestamp}:${nonce}`;
+                    const verifier = crypto.createVerify('SHA256');
+                    verifier.update(sigData);
+                    verified = verifier.verify(pem, Buffer.from(signature, 'base64'));
+                }
+                catch (e) {
+                    console.warn('[Device Key Auth] 署名パース失敗:', e.message);
+                }
+
+                if (!verified) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '端末の暗号鍵署名が一致しません' }));
+                    return true;
+                }
+
+                // 署名検証成功後にNonceを登録 (VULN-242是正: メモリ枯渇DoS防止)
+                seenInviteNonces.add(nonce);
+                setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+
+                // 2. 登録済み公開鍵照合 (SEC-01是正: 無条件TOFU・isSameDevice単独での鍵差し替えを完全廃止)
+                const registeredRec = phoneStore.get(email);
+                const existingCleanPub = registeredRec && registeredRec.devicePubKey ? registeredRec.devicePubKey.trim().replace(/\s+/g, '') : '';
+                const isSameDevice = registeredRec && registeredRec.deviceUid && registeredRec.deviceUid === deviceUid;
+                const isExactMatch = Boolean(existingCleanPub && existingCleanPub === incomingCleanPub && isSameDevice);
+
+                if (!isExactMatch) {
+                    const hasSessionProof = hasValidEmailSession(incomingSessionToken, deviceUid, emailHash);
+                    const hasGoogleProof = !hasSessionProof && idToken ? await verifyGoogleIdToken(idToken, email) : false;
+                    if (!hasSessionProof && !hasGoogleProof) {
+                        const reason = (!registeredRec || !registeredRec.devicePubKey) ? '未登録端末 (Google本人確認/OTP必須)' : '登録済み端末鍵不一致または鍵変更試行';
+                        console.warn(`[Device Key Auth Rejected] ${reason}: ${maskEmail(email)} (送信UID: ${deviceUid})`);
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, code: 'DEVICE_AUTH_REQUIRED', error: '端末の認証にはGoogleログイン確認または相互承認コードが必要です' }));
+                        return true;
+                    }
+
+                    const proofType = hasGoogleProof ? 'Google IDToken' : '有効Session';
+                    console.log(`[Device Key Auth] ${proofType}確認により端末公開鍵を安全に登録・更新: ${maskEmail(email)} (UID: ${deviceUid})`);
+                    phoneStore.set(email, {
+                        ...(registeredRec || {}),
+                        deviceUid,
+                        devicePubKey,
+                        linkedAt: Date.now()
+                    });
+                    savePhoneStore();
+                }
+
+                // セッショントークン発行 (3日間有効)
+                const expiresAt = Date.now() + SESSION_DURATION_MS;
+                const sessionToken = createStatelessSessionToken(email, deviceUid, expiresAt);
+                enforceMapSizeCap(activeSessions, 5000);
+                activeSessions.set(sessionToken, {
+                    email,
+                    emailHash,
+                    deviceUid,
+                    createdAt: Date.now(),
+                    expiresAt,
+                    lastExtendedAt: Date.now()
+                });
+                saveSessions();
+
+                console.log(`[Device Key Auth Success] 端末暗号鍵による自己完結ログイン成功: ${maskEmail(email)} (UID: ${deviceUid})`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     success: true,
-                    message: `承認コードを「${maskedTarget}」宛てに送信しました。\n相手の方からLINE等でコードを受け取ってください。`,
-                    targetNotice: maskedTarget
+                    sessionToken: sessionToken,
+                    email: email,
+                    expiresAt: expiresAt,
+                    vaultVersionSupported: 4,
+                    message: '端末の暗号鍵で本人確認が完了しました'
                 }));
+                return true;
             }
-            else
-            {
-                console.error('[OTP Error] GMAIL_USER/GAS_MAIL_URL が未設定のため認証コードを送信できません');
+            catch (err) {
+                console.error('[Device Key Auth Error]', err);
                 res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({
-                    success: false,
-                    error: 'メール送信設定が未構成のため認証コードを発行できません。管理者へお問い合わせください。'
-                }));
+                res.end(JSON.stringify({ success: false, error: '内部認証エラーが発生しました' }));
+                return true;
             }
-            return true;
         }
-        catch (err)
-        {
-            console.error('[OTP Send Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '認証コード送信中にエラーが発生しました' }));
-            return true;
-        }
-    }
 
+        // [API 2] OTP検証: POST /api/auth/verify-otp
+        if (req.method === 'POST' && url === '/api/auth/verify-otp') {
+            try {
+                const body = await parseJsonBody(req);
+                const email = (body.email || '').trim().toLowerCase();
+                const inputCode = (body.code || '').trim();
 
-    // [API 2.2] 端末暗号鍵による自己完結・即時ログイン: POST /api/auth/verify-device-key
-    // SEC-01是正: 無条件TOFU・isSameDevice単独鍵上書きを廃止し、登録鍵一致・有効セッション・Google IDトークン検証のみ許可
-    if (req.method === 'POST' && url === '/api/auth/verify-device-key')
-    {
-        try
-        {
-            await ensureRemoteStoresLoaded();
-            const body = await parseJsonBody(req);
-            const email = (body.email || '').trim().toLowerCase();
-            const deviceUid = (body.deviceUid || '').trim();
-            const devicePubKey = (body.devicePubKey || '').trim();
-            const signature = (body.signature || '').trim();
-            const timestamp = Number(body.timestamp) || 0;
-            const nonce = (body.nonce || '').trim();
-            const idToken = (body.idToken || '').trim();
-            const incomingSessionToken = extractBearerToken(req) || (body.sessionToken || '').trim();
-
-            if (!email || !deviceUid || !devicePubKey || !signature || !timestamp || !nonce)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証パラメータが不足しています' }));
-                return true;
-            }
-
-            if (!/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
-                return true;
-            }
-
-            const emailHash = sha256(email);
-            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
-            {
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'アクセスが許可されていないアカウントです' }));
-                return true;
-            }
-
-            // 鮮度検証 (60秒以内)
-            const now = Date.now();
-            if (Math.abs(now - timestamp) > 60000)
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
-                return true;
-            }
-
-            // Nonce形式検証 (VULN-242是正)
-            if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'Nonce形式が不正です' }));
-                return true;
-            }
-
-            // Nonceリプレイ検証
-            if (seenInviteNonces.has(nonce))
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
-                return true;
-            }
-
-            // 1. 端末ハードウェアECDSA署名検証を最優先で実施
-            const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, '');
-            let verified = false;
-            try
-            {
-                const pem = `-----BEGIN PUBLIC KEY-----\n${incomingCleanPub}\n-----END PUBLIC KEY-----`;
-                const sigData = `DEVICE_KEY_AUTH:${email}:${deviceUid}:${timestamp}:${nonce}`;
-                const verifier = crypto.createVerify('SHA256');
-                verifier.update(sigData);
-                verified = verifier.verify(pem, Buffer.from(signature, 'base64'));
-            }
-            catch (e)
-            {
-                console.warn('[Device Key Auth] 署名パース失敗:', e.message);
-            }
-
-            if (!verified)
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末の暗号鍵署名が一致しません' }));
-                return true;
-            }
-
-            // 署名検証成功後にNonceを登録 (VULN-242是正: メモリ枯渇DoS防止)
-            seenInviteNonces.add(nonce);
-            setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
-
-            // 2. 登録済み公開鍵照合 (SEC-01是正: 無条件TOFU・isSameDevice単独での鍵差し替えを完全廃止)
-            const registeredRec = phoneStore.get(email);
-            const existingCleanPub = registeredRec && registeredRec.devicePubKey ? registeredRec.devicePubKey.trim().replace(/\s+/g, '') : '';
-            const isSameDevice = registeredRec && registeredRec.deviceUid && registeredRec.deviceUid === deviceUid;
-            const isExactMatch = Boolean(existingCleanPub && existingCleanPub === incomingCleanPub && isSameDevice);
-
-            if (!isExactMatch)
-            {
-                const hasSessionProof = hasValidEmailSession(incomingSessionToken, deviceUid, emailHash);
-                const hasGoogleProof = !hasSessionProof && idToken ? await verifyGoogleIdToken(idToken, email) : false;
-                if (!hasSessionProof && !hasGoogleProof)
-                {
-                    const reason = (!registeredRec || !registeredRec.devicePubKey) ? '未登録端末 (Google本人確認/OTP必須)' : '登録済み端末鍵不一致または鍵変更試行';
-                    console.warn(`[Device Key Auth Rejected] ${reason}: ${maskEmail(email)} (送信UID: ${deviceUid})`);
-                    res.writeHead(401, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, code: 'DEVICE_AUTH_REQUIRED', error: '端末の認証にはGoogleログイン確認または相互承認コードが必要です' }));
+                const entry = otpStore.get(email);
+                if (!entry) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証コードが発行されていないか、有効期限が切れています' }));
                     return true;
                 }
 
-                const proofType = hasGoogleProof ? 'Google IDToken' : '有効Session';
-                console.log(`[Device Key Auth] ${proofType}確認により端末公開鍵を安全に登録・更新: ${maskEmail(email)} (UID: ${deviceUid})`);
-                phoneStore.set(email, {
-                    ...(registeredRec || {}),
+                if (entry.expiresAt < Date.now()) {
+                    otpStore.delete(email);
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証コードの有効期限が切れました。再送信してください' }));
+                    return true;
+                }
+
+                entry.attempts++;
+                if (entry.attempts > 5) {
+                    otpStore.delete(email);
+                    res.writeHead(429, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証試行回数の上限を超えました。コードを再発行してください' }));
+                    return true;
+                }
+
+                if (inputCode.length !== 6 || entry.code.length !== 6) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証コードは6桁の数字です' }));
+                    return true;
+                }
+
+                const codeMatch = crypto.timingSafeEqual(
+                    Buffer.from(entry.code, 'utf8'),
+                    Buffer.from(inputCode, 'utf8')
+                );
+
+                if (!codeMatch) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証コードが一致しません' }));
+                    return true;
+                }
+
+                // VULN-243是正: OTP消費前にdeviceUidを先行検証し誤破棄を防止
+                const deviceUid = (body.deviceUid || '').trim();
+                const devicePubKey = (body.devicePubKey || '').trim();
+                if (!deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
+                    return true;
+                }
+
+                otpStore.delete(email);
+
+                // 初回相互承認完了に伴い、端末情報(暗号公開鍵)を自動紐づけ登録 (既存電話番号フィールド等を保持)
+                if (devicePubKey) {
+                    const existingRec = phoneStore.get(email) || {};
+                    phoneStore.set(email, {
+                        ...existingRec,
+                        deviceUid,
+                        devicePubKey,
+                        linkedAt: Date.now()
+                    });
+                    savePhoneStore();
+                    console.log(`[Device Registered via OTP] 端末情報(公開鍵)を自動紐づけ保存完了: ${maskEmail(email)} (UID: ${deviceUid})`);
+                }
+
+                const expiresAt = Date.now() + SESSION_DURATION_MS;
+                const sessionToken = createStatelessSessionToken(email, deviceUid, expiresAt);
+                enforceMapSizeCap(activeSessions, 5000);
+                activeSessions.set(sessionToken, {
+                    email,
+                    emailHash: sha256(email),
                     deviceUid,
-                    devicePubKey,
-                    linkedAt: Date.now()
+                    createdAt: Date.now(),
+                    expiresAt,
+                    lastExtendedAt: Date.now()
                 });
-                savePhoneStore();
+                saveSessions();
+
+                console.log(`[Auth Success] 認証完了: ${maskEmail(email)} (端末: ${deviceUid}) -> ステートレスHMACセッショントークン発行`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    sessionToken: sessionToken,
+                    email: email,
+                    expiresAt: expiresAt,
+                    vaultVersionSupported: 4
+                }));
+                return true;
             }
-
-            // セッショントークン発行 (3日間有効)
-            const expiresAt = Date.now() + SESSION_DURATION_MS;
-            const sessionToken = createStatelessSessionToken(email, deviceUid, expiresAt);
-            enforceMapSizeCap(activeSessions, 5000);
-            activeSessions.set(sessionToken, {
-                email,
-                emailHash,
-                deviceUid,
-                createdAt: Date.now(),
-                expiresAt,
-                lastExtendedAt: Date.now()
-            });
-            saveSessions();
-
-            console.log(`[Device Key Auth Success] 端末暗号鍵による自己完結ログイン成功: ${maskEmail(email)} (UID: ${deviceUid})`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                sessionToken: sessionToken,
-                email: email,
-                expiresAt: expiresAt,
-                vaultVersionSupported: 4,
-                message: '端末の暗号鍵で本人確認が完了しました'
-            }));
-            return true;
+            catch (err) {
+                console.error('[OTP Verify Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '内部認証処理エラーが発生しました' }));
+                return true;
+            }
         }
-        catch (err)
-        {
-            console.error('[Device Key Auth Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '内部認証エラー: ' + err.message }));
-            return true;
-        }
-    }
 
-    // [API 2] OTP検証: POST /api/auth/verify-otp
-    if (req.method === 'POST' && url === '/api/auth/verify-otp')
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const email = (body.email || '').trim().toLowerCase();
-            const inputCode = (body.code || '').trim();
+        // [API 2.3] 端末とGoogleアカウントの紐づけ登録: POST /api/auth/link-device
+        if (req.method === 'POST' && url === '/api/auth/link-device') {
+            try {
+                await ensureRemoteStoresLoaded();
+                const body = await parseJsonBody(req);
+                const email = (body.email || '').trim().toLowerCase();
+                const deviceUid = (body.deviceUid || '').trim();
+                const devicePubKey = (body.devicePubKey || '').trim();
+                const signature = (body.signature || '').trim();
+                const timestamp = Number(body.timestamp) || 0;
+                const nonce = (body.nonce || '').trim();
+                const idToken = (body.idToken || '').trim();
+                const sessionToken = extractBearerToken(req) || (body.sessionToken || '').trim();
 
-            const entry = otpStore.get(email);
-            if (!entry)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証コードが発行されていないか、有効期限が切れています' }));
-                return true;
-            }
+                if (!email || !deviceUid || !devicePubKey || !signature || !timestamp || !nonce) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証パラメータが不足しています' }));
+                    return true;
+                }
 
-            if (entry.expiresAt < Date.now())
-            {
-                otpStore.delete(email);
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証コードの有効期限が切れました。再送信してください' }));
-                return true;
-            }
+                if (!/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
+                    return true;
+                }
 
-            entry.attempts++;
-            if (entry.attempts > 5)
-            {
-                otpStore.delete(email);
-                res.writeHead(429, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証試行回数の上限を超えました。コードを再発行してください' }));
-                return true;
-            }
+                const emailHash = sha256(email);
+                if (!ALLOWED_EMAIL_HASHES.has(emailHash)) {
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アクセスが許可されていないアカウントです' }));
+                    return true;
+                }
 
-            if (inputCode.length !== 6 || entry.code.length !== 6)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証コードは6桁の数字です' }));
-                return true;
-            }
+                // 鮮度検証 (60秒以内)
+                const now = Date.now();
+                if (Math.abs(now - timestamp) > 60000) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
+                    return true;
+                }
 
-            const codeMatch = crypto.timingSafeEqual(
-                Buffer.from(entry.code, 'utf8'),
-                Buffer.from(inputCode, 'utf8')
-            );
+                // Nonce形式検証 (VULN-242是正)
+                if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'Nonce形式が不正です' }));
+                    return true;
+                }
 
-            if (!codeMatch)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証コードが一致しません' }));
-                return true;
-            }
+                // Nonceリプレイ検証
+                if (seenInviteNonces.has(nonce)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
+                    return true;
+                }
 
-            // VULN-243是正: OTP消費前にdeviceUidを先行検証し誤破棄を防止
-            const deviceUid = (body.deviceUid || '').trim();
-            const devicePubKey = (body.devicePubKey || '').trim();
-            if (!deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
-                return true;
-            }
+                // 端末ハードウェアECDSA署名検証
+                const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, '');
+                let verified = false;
+                try {
+                    const pem = `-----BEGIN PUBLIC KEY-----\n${incomingCleanPub}\n-----END PUBLIC KEY-----`;
+                    const sigData = `DEVICE_LINK:${email}:${deviceUid}:${timestamp}:${nonce}`;
+                    const verifier = crypto.createVerify('SHA256');
+                    verifier.update(sigData);
+                    verified = verifier.verify(pem, Buffer.from(signature, 'base64'));
+                }
+                catch (sigErr) {
+                    console.warn(`[Device Link] 署名パース失敗: ${sigErr.message}`);
+                }
 
-            otpStore.delete(email);
+                if (!verified) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '端末の電子署名検証に失敗しました' }));
+                    return true;
+                }
 
-            // 初回相互承認完了に伴い、端末情報(暗号公開鍵)を自動紐づけ登録 (既存電話番号フィールド等を保持)
-            if (devicePubKey)
-            {
+                // 署名検証成功後にNonceを登録 (VULN-242是正)
+                seenInviteNonces.add(nonce);
+                setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+
+                // SEC-01是正: 有効セッションまたは検証済みGoogle IDトークンが無い場合の公開鍵紐づけ・変更を全面遮断
+                const hasValidSessionForEmail = hasValidEmailSession(sessionToken, deviceUid, emailHash);
+                const hasValidGoogleIdToken = !hasValidSessionForEmail && idToken ? await verifyGoogleIdToken(idToken, email) : false;
                 const existingRec = phoneStore.get(email) || {};
+
+                if (!hasValidSessionForEmail && !hasValidGoogleIdToken) {
+                    console.warn(`[Device Link Blocked] 未認証での公開鍵登録・変更試行を遮断: ${maskEmail(email)} (UID: ${deviceUid})`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, code: 'DEVICE_AUTH_REQUIRED', error: '端末の紐づけにはログインセッションまたはGoogle本人確認が必要です' }));
+                    return true;
+                }
+
+                // 許可済みアカウントのハードウェアECDSA署名・Nonce・本人証明を通過した端末鍵を即時更新保存
                 phoneStore.set(email, {
                     ...existingRec,
                     deviceUid,
@@ -1865,1112 +1864,1086 @@ async function handleAuthRoutes(req, res, url)
                     linkedAt: Date.now()
                 });
                 savePhoneStore();
-                console.log(`[Device Registered via OTP] 端末情報(公開鍵)を自動紐づけ保存完了: ${email} (UID: ${deviceUid})`);
+
+                console.log(`[Device Link Success] 端末とGoogleアカウントを正常に紐づけました: ${maskEmail(email)} (UID: ${deviceUid})`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    vaultVersionSupported: 4,
+                    message: '端末とGoogleアカウントを正常に紐づけました。次回からワンタップで即時ログインできます。'
+                }));
+                return true;
             }
+            catch (e) {
+                console.error('[Device Link Error]', e);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '端末紐づけ処理中にサーバーエラーが発生しました' }));
+                return true;
+            }
+        }
 
-            const expiresAt = Date.now() + SESSION_DURATION_MS;
-            const sessionToken = createStatelessSessionToken(email, deviceUid, expiresAt);
-            enforceMapSizeCap(activeSessions, 5000);
-            activeSessions.set(sessionToken, {
-                email,
-                emailHash: sha256(email),
-                deviceUid,
-                createdAt: Date.now(),
-                expiresAt,
-                lastExtendedAt: Date.now()
-            });
-            saveSessions();
 
-            console.log(`[Auth Success] 認証完了: ${email} (端末: ${deviceUid}) -> ステートレスHMACセッショントークン発行`);
+        // [API 2.5] ログアウト: POST /api/auth/logout (VULN-124是正: 正規トークンのみ失効リストに追加)
+        if (req.method === 'POST' && url === '/api/auth/logout') {
+            const token = extractBearerToken(req);
+            if (token && isValidSession(token)) {
+                revokeSessionToken(token);
+                console.log(`[Auth Logout] セッショントークンをブラックリストに登録し完全失効させました`);
+            }
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                sessionToken: sessionToken,
-                email: email,
-                expiresAt: expiresAt,
-                vaultVersionSupported: 4
-            }));
+            res.end(JSON.stringify({ success: true, message: 'ログアウトしました' }));
             return true;
         }
-        catch (err)
-        {
-            console.error('[OTP Verify Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '内部認証処理エラー: ' + err.message }));
-            return true;
-        }
-    }
 
-    // [API 2.3] 端末とGoogleアカウントの紐づけ登録: POST /api/auth/link-device
-    if (req.method === 'POST' && url === '/api/auth/link-device')
-    {
-        try
-        {
-            await ensureRemoteStoresLoaded();
-            const body = await parseJsonBody(req);
-            const email = (body.email || '').trim().toLowerCase();
-            const deviceUid = (body.deviceUid || '').trim();
-            const devicePubKey = (body.devicePubKey || '').trim();
-            const signature = (body.signature || '').trim();
-            const timestamp = Number(body.timestamp) || 0;
-            const nonce = (body.nonce || '').trim();
-            const idToken = (body.idToken || '').trim();
-            const sessionToken = extractBearerToken(req) || (body.sessionToken || '').trim();
-
-            if (!email || !deviceUid || !devicePubKey || !signature || !timestamp || !nonce)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証パラメータが不足しています' }));
-                return true;
-            }
-
-            if (!/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末固有識別子(deviceUid)が不正です' }));
-                return true;
-            }
-
-            const emailHash = sha256(email);
-            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
-            {
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'アクセスが許可されていないアカウントです' }));
-                return true;
-            }
-
-            // 鮮度検証 (60秒以内)
-            const now = Date.now();
-            if (Math.abs(now - timestamp) > 60000)
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
-                return true;
-            }
-
-            // Nonce形式検証 (VULN-242是正)
-            if (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'Nonce形式が不正です' }));
-                return true;
-            }
-
-            // Nonceリプレイ検証
-            if (seenInviteNonces.has(nonce))
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
-                return true;
-            }
-
-            // 端末ハードウェアECDSA署名検証
-            const incomingCleanPub = devicePubKey.trim().replace(/\s+/g, '');
-            let verified = false;
-            try
-            {
-                const pem = `-----BEGIN PUBLIC KEY-----\n${incomingCleanPub}\n-----END PUBLIC KEY-----`;
-                const sigData = `DEVICE_LINK:${email}:${deviceUid}:${timestamp}:${nonce}`;
-                const verifier = crypto.createVerify('SHA256');
-                verifier.update(sigData);
-                verified = verifier.verify(pem, Buffer.from(signature, 'base64'));
-            }
-            catch (sigErr)
-            {
-                console.warn(`[Device Link] 署名パース失敗: ${sigErr.message}`);
-            }
-
-            if (!verified)
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '端末の電子署名検証に失敗しました' }));
-                return true;
-            }
-
-            // 署名検証成功後にNonceを登録 (VULN-242是正)
-            seenInviteNonces.add(nonce);
-            setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
-
-            // SEC-01是正: 有効セッションまたは検証済みGoogle IDトークンが無い場合の公開鍵紐づけ・変更を全面遮断
-            const hasValidSessionForEmail = hasValidEmailSession(sessionToken, deviceUid, emailHash);
-            const hasValidGoogleIdToken = !hasValidSessionForEmail && idToken ? await verifyGoogleIdToken(idToken, email) : false;
-            const existingRec = phoneStore.get(email) || {};
-
-            if (!hasValidSessionForEmail && !hasValidGoogleIdToken)
-            {
-                console.warn(`[Device Link Blocked] 未認証での公開鍵登録・変更試行を遮断: ${maskEmail(email)} (UID: ${deviceUid})`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, code: 'DEVICE_AUTH_REQUIRED', error: '端末の紐づけにはログインセッションまたはGoogle本人確認が必要です' }));
-                return true;
-            }
-
-            // 許可済みアカウントのハードウェアECDSA署名・Nonce・本人証明を通過した端末鍵を即時更新保存
-            phoneStore.set(email, {
-                ...existingRec,
-                deviceUid,
-                devicePubKey,
-                linkedAt: Date.now()
-            });
-            savePhoneStore();
-
-            console.log(`[Device Link Success] 端末とGoogleアカウントを正常に紐づけました: ${maskEmail(email)} (UID: ${deviceUid})`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                vaultVersionSupported: 4,
-                message: '端末とGoogleアカウントを正常に紐づけました。次回からワンタップで即時ログインできます。'
-            }));
-            return true;
-        }
-        catch (e)
-        {
-            console.error('[Device Link Error]', e);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '端末紐づけ処理中にサーバーエラーが発生しました: ' + e.message }));
-            return true;
-        }
-    }
-
-
-    // [API 2.5] ログアウト: POST /api/auth/logout (VULN-124是正: 正規トークンのみ失効リストに追加)
-    if (req.method === 'POST' && url === '/api/auth/logout')
-    {
-        const token = extractBearerToken(req);
-        if (token && isValidSession(token))
-        {
-            revokeSessionToken(token);
-            console.log(`[Auth Logout] セッショントークンをブラックリストに登録し完全失効させました`);
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, message: 'ログアウトしました' }));
-        return true;
-    }
-
-    // [API 2.6] セッショントークン裏更新: POST /api/auth/refresh
-    if (req.method === 'POST' && url === '/api/auth/refresh')
-    {
-        const token = extractBearerToken(req);
-        const deviceUid = (req.headers['x-device-uid'] || '').trim();
-        if (token && isValidSession(token, deviceUid, true))
-        {
-            let session = activeSessions.get(token);
-            if (!session && token.startsWith('st1.'))
-            {
-                session = verifyAndRestoreStatelessToken(token);
-            }
-            if (!session)
-            {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'セッション情報の復元に失敗しました' }));
-                return true;
-            }
-
-            const newExpiresAt = Date.now() + SESSION_DURATION_MS;
-            const effUid = session.deviceUid || deviceUid;
-            const newToken = createStatelessSessionToken(session.email, effUid, newExpiresAt);
-
-            // VULN-35是正: 旧トークンを5分間のGrace Period猶予付きで失効登録（通信遅延・WebSocket即死完全防止）
-            revokeSessionToken(token, 5 * 60 * 1000);
-
-            enforceMapSizeCap(activeSessions, 5000);
-            activeSessions.set(newToken, {
-                email: session.email,
-                emailHash: session.emailHash || sha256(session.email || ''),
-                deviceUid: effUid,
-                createdAt: session.createdAt || Date.now(),
-                expiresAt: newExpiresAt,
-                lastExtendedAt: Date.now()
-            });
-            saveSessions();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                message: 'セッションを3日間自動延長しました',
-                sessionToken: newToken,
-                expiresAt: newExpiresAt
-            }));
-            return true;
-        }
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'セッションが無効または失効しています' }));
-        return true;
-    }
-
-    // [API 2.7] サーバー再起動・更新時の認証済みセッション自動復旧 ＆ 鍵交換: POST /api/auth/rebind-session, /api/auth/rekey
-    // VULN-79是正: oldTokenのHMAC署名検証に加え、ハードウェアECDSA署名・Nonceリプレイ検証による再ログイン不要のセキュア鍵交換をサポート
-    if (req.method === 'POST' && (url === '/api/auth/rebind-session' || url === '/api/auth/rekey'))
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const email = (body.email || '').trim().toLowerCase();
-            const deviceUid = (body.deviceUid || '').trim();
-            const oldToken = extractBearerToken(req) || (body.sessionToken || '').trim();
-            const devicePubKey = (body.devicePubKey || '').trim();
-            const timestamp = Number(body.timestamp) || 0;
-            const nonce = (body.nonce || '').trim();
-            const signature = (body.signature || '').trim();
-
-            if (!email || !deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid))
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'パラメータが不正です' }));
-                return true;
-            }
-
-            const emailHash = sha256(email);
-            if (!ALLOWED_EMAIL_HASHES.has(emailHash))
-            {
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '未許可アカウントです' }));
-                return true;
-            }
-
-            // VULN-195 & VULN-243是正: 署名再バインド経路では timestamp と nonce を必須化
-            if (devicePubKey || signature)
-            {
-                if (!timestamp || !nonce || !/^[A-Za-z0-9_-]{16,64}$/.test(nonce))
-                {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: 'タイムスタンプまたはNonceが不正です' }));
+        // [API 2.6] セッショントークン裏更新: POST /api/auth/refresh
+        if (req.method === 'POST' && url === '/api/auth/refresh') {
+            const token = extractBearerToken(req);
+            const deviceUid = (req.headers['x-device-uid'] || '').trim();
+            if (token && isValidSession(token, deviceUid, true)) {
+                let session = activeSessions.get(token);
+                if (!session && token.startsWith('st1.')) {
+                    session = verifyAndRestoreStatelessToken(token);
+                }
+                if (!session) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'セッション情報の復元に失敗しました' }));
                     return true;
                 }
-            }
 
-            const nowTime = Date.now();
-            if (timestamp && Math.abs(nowTime - timestamp) > 60000)
-            {
-                console.warn(`[Security Block] セッション再バインドのTimestamp期限切れ(鮮度60秒超過): ${timestamp}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
+                const newExpiresAt = Date.now() + SESSION_DURATION_MS;
+                const effUid = session.deviceUid || deviceUid;
+                const newToken = createStatelessSessionToken(session.email, effUid, newExpiresAt);
+
+                // VULN-35是正: 旧トークンを5分間のGrace Period猶予付きで失効登録（通信遅延・WebSocket即死完全防止）
+                revokeSessionToken(token, 5 * 60 * 1000);
+
+                enforceMapSizeCap(activeSessions, 5000);
+                activeSessions.set(newToken, {
+                    email: session.email,
+                    emailHash: session.emailHash || sha256(session.email || ''),
+                    deviceUid: effUid,
+                    createdAt: session.createdAt || Date.now(),
+                    expiresAt: newExpiresAt,
+                    lastExtendedAt: Date.now()
+                });
+                saveSessions();
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    message: 'セッションを3日間自動延長しました',
+                    sessionToken: newToken,
+                    expiresAt: newExpiresAt
+                }));
                 return true;
             }
-            if (nonce && seenInviteNonces.has(nonce))
-            {
-                console.warn(`[Security Block] セッション再バインドのNonceリプレイを遮断: ${nonce}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
-                return true;
-            }
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'セッションが無効または失効しています' }));
+            return true;
+        }
 
-            let signatureVerified = false;
-            if (devicePubKey && signature)
-            {
-                try
-                {
-                    const cleanPub = devicePubKey.trim().replace(/\s+/g, '');
-                    const pem = `-----BEGIN PUBLIC KEY-----\n${cleanPub}\n-----END PUBLIC KEY-----\n`;
-                    const sigData = `${email}:${deviceUid}:${oldToken}:${timestamp}:${nonce}`;
-                    const verifier = crypto.createVerify('SHA256');
-                    verifier.update(sigData);
-                    if (verifier.verify(pem, Buffer.from(signature, 'base64')))
-                    {
-                        signatureVerified = true;
-                        seenInviteNonces.add(nonce);
-                        setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
-                    }
-                    else
-                    {
-                        console.warn(`[Security Block] セッション再バインドの端末電子署名不一致: uid=${deviceUid}`);
-                        res.writeHead(401, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: false, error: '端末の電子署名検証に失敗しました' }));
+        // [API 2.7] サーバー再起動・更新時の認証済みセッション自動復旧 ＆ 鍵交換: POST /api/auth/rebind-session, /api/auth/rekey
+        // VULN-79是正: oldTokenのHMAC署名検証に加え、ハードウェアECDSA署名・Nonceリプレイ検証による再ログイン不要のセキュア鍵交換をサポート
+        if (req.method === 'POST' && (url === '/api/auth/rebind-session' || url === '/api/auth/rekey')) {
+            try {
+                const body = await parseJsonBody(req);
+                const email = (body.email || '').trim().toLowerCase();
+                const deviceUid = (body.deviceUid || '').trim();
+                const oldToken = extractBearerToken(req) || (body.sessionToken || '').trim();
+                const devicePubKey = (body.devicePubKey || '').trim();
+                const timestamp = Number(body.timestamp) || 0;
+                const nonce = (body.nonce || '').trim();
+                const signature = (body.signature || '').trim();
+
+                if (!email || !deviceUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(deviceUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'パラメータが不正です' }));
+                    return true;
+                }
+
+                const emailHash = sha256(email);
+                if (!ALLOWED_EMAIL_HASHES.has(emailHash)) {
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '未許可アカウントです' }));
+                    return true;
+                }
+
+                // VULN-195 & VULN-243是正: 署名再バインド経路では timestamp と nonce を必須化
+                if (devicePubKey || signature) {
+                    if (!timestamp || !nonce || !/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: 'タイムスタンプまたはNonceが不正です' }));
                         return true;
                     }
                 }
-                catch (sigErr)
-                {
-                    console.warn(`[Security Block] セッション再バインドの署名検証例外: ${sigErr.message}`);
+
+                const nowTime = Date.now();
+                if (timestamp && Math.abs(nowTime - timestamp) > 60000) {
+                    console.warn(`[Security Block] セッション再バインドのTimestamp期限切れ(鮮度60秒超過): ${timestamp}`);
                     res.writeHead(401, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: '電子署名検証に失敗しました' }));
+                    res.end(JSON.stringify({ success: false, error: 'リクエストの有効期限が切れています' }));
                     return true;
                 }
-            }
-
-            let ownerVerified = false;
-            let existingSession = null;
-
-            // 1. 登録済み公開鍵と端末ECDSA電子署名による自己治癒認証 (サーバー再起動・エフェメラル環境でも自動更新)
-            const registeredPhoneRec = phoneStore.get(email);
-            const expectedPubKey = registeredPhoneRec?.devicePubKey || '';
-            if (signatureVerified && expectedPubKey && expectedPubKey === devicePubKey)
-            {
-                ownerVerified = true;
-                console.log(`[Session Auto-Heal] 登録端末のECDSA電子署名によりセッション自己治癒更新を認可: ${email} (UID: ${deviceUid})`);
-            }
-
-            // 2. 既存セッショントークンによる検証
-            if (oldToken && !isTokenRevoked(oldToken))
-            {
-                if (isValidSession(oldToken, deviceUid, false))
-                {
-                    existingSession = activeSessions.get(oldToken);
-                }
-                else if (oldToken.startsWith('st1.'))
-                {
-                    existingSession = verifyAndRestoreStatelessToken(oldToken);
+                if (nonce && seenInviteNonces.has(nonce)) {
+                    console.warn(`[Security Block] セッション再バインドのNonceリプレイを遮断: ${nonce}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'リプレイ攻撃が検出されました' }));
+                    return true;
                 }
 
-                if (existingSession)
-                {
-                    const existingEmailHash = existingSession.emailHash || sha256(existingSession.email || '');
-                    if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid)
-                    {
-                        ownerVerified = true;
+                let signatureVerified = false;
+                if (devicePubKey && signature) {
+                    try {
+                        const cleanPub = devicePubKey.trim().replace(/\s+/g, '');
+                        const pem = `-----BEGIN PUBLIC KEY-----\n${cleanPub}\n-----END PUBLIC KEY-----\n`;
+                        const sigData = `${email}:${deviceUid}:${oldToken}:${timestamp}:${nonce}`;
+                        const verifier = crypto.createVerify('SHA256');
+                        verifier.update(sigData);
+                        if (verifier.verify(pem, Buffer.from(signature, 'base64'))) {
+                            signatureVerified = true;
+                            seenInviteNonces.add(nonce);
+                            setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+                        }
+                        else {
+                            console.warn(`[Security Block] セッション再バインドの端末電子署名不一致: uid=${deviceUid}`);
+                            res.writeHead(401, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: '端末の電子署名検証に失敗しました' }));
+                            return true;
+                        }
+                    }
+                    catch (sigErr) {
+                        console.warn(`[Security Block] セッション再バインドの署名検証例外: ${sigErr.message}`);
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: '電子署名検証に失敗しました' }));
+                        return true;
                     }
                 }
-            }
 
-            if (!ownerVerified)
-            {
-                console.warn(`[Security Block] 不正署名または所有者が異なるトークンでの再バインドを遮断: uid=${deviceUid}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'セッションの署名検証に失敗したか、所有者情報が一致しません。再ログインしてください' }));
+                let ownerVerified = false;
+                let existingSession = null;
+
+                // 1. 登録済み公開鍵と端末ECDSA電子署名による自己治癒認証 (サーバー再起動・エフェメラル環境でも自動更新)
+                const registeredPhoneRec = phoneStore.get(email);
+                const expectedPubKey = registeredPhoneRec?.devicePubKey || '';
+                if (signatureVerified && expectedPubKey && expectedPubKey === devicePubKey) {
+                    ownerVerified = true;
+                    console.log(`[Session Auto-Heal] 登録端末のECDSA電子署名によりセッション自己治癒更新を認可: ${maskEmail(email)} (UID: ${deviceUid})`);
+                }
+
+                // 2. 既存セッショントークンによる検証
+                if (oldToken && !isTokenRevoked(oldToken)) {
+                    if (isValidSession(oldToken, deviceUid, false)) {
+                        existingSession = activeSessions.get(oldToken);
+                    }
+                    else if (oldToken.startsWith('st1.')) {
+                        existingSession = verifyAndRestoreStatelessToken(oldToken);
+                    }
+
+                    if (existingSession) {
+                        const existingEmailHash = existingSession.emailHash || sha256(existingSession.email || '');
+                        if ((!existingEmailHash || existingEmailHash === emailHash) && existingSession.deviceUid === deviceUid) {
+                            ownerVerified = true;
+                        }
+                    }
+                }
+
+                if (!ownerVerified) {
+                    console.warn(`[Security Block] 不正署名または所有者が異なるトークンでの再バインドを遮断: uid=${deviceUid}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'セッションの署名検証に失敗したか、所有者情報が一致しません。再ログインしてください' }));
+                    return true;
+                }
+
+                if (oldToken) {
+                    revokeSessionToken(oldToken, 5 * 60 * 1000);
+                }
+
+                const expiresAt = Date.now() + SESSION_DURATION_MS;
+                const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
+                const sessionObj = {
+                    email,
+                    emailHash,
+                    deviceUid,
+                    createdAt: existingSession?.createdAt || Date.now(),
+                    expiresAt,
+                    lastExtendedAt: Date.now()
+                };
+                enforceMapSizeCap(activeSessions, 5000);
+                activeSessions.set(newToken, sessionObj);
+                saveSessions();
+
+                console.log(`[Session Rebind] 認証済みセッションを安全に更新: ${maskEmail(email)} (UID: ${deviceUid})`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    success: true,
+                    sessionToken: newToken,
+                    expiresAt: expiresAt
+                }));
                 return true;
             }
-
-            if (oldToken)
-            {
-                revokeSessionToken(oldToken, 5 * 60 * 1000);
+            catch (err) {
+                console.error('[Session Rebind Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'セッション再バインド中にサーバーエラーが発生しました' }));
+                return true;
             }
-
-            const expiresAt = Date.now() + SESSION_DURATION_MS;
-            const newToken = createStatelessSessionToken(email, deviceUid, expiresAt);
-            const sessionObj = {
-                email,
-                emailHash,
-                deviceUid,
-                createdAt: existingSession?.createdAt || Date.now(),
-                expiresAt,
-                lastExtendedAt: Date.now()
-            };
-            enforceMapSizeCap(activeSessions, 5000);
-            activeSessions.set(newToken, sessionObj);
-            saveSessions();
-
-            console.log(`[Session Rebind] 認証済みセッションを安全に更新: ${email} (UID: ${deviceUid})`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-                success: true,
-                sessionToken: newToken,
-                expiresAt: expiresAt
-            }));
-            return true;
         }
-        catch (err)
-        {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
+
+        // [API 3] FCMデバイストークン登録: POST /api/user/fcm-token (SEC-04是正: 長さ・型・メール整合検証)
+        if (req.method === 'POST' && url === '/api/user/fcm-token') {
+            try {
+                const body = await parseJsonBody(req);
+                const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
+                const reqEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+                const fcmToken = typeof body.fcmToken === 'string' ? body.fcmToken.trim() : '';
+                const token = extractBearerToken(req) || (typeof body.token === 'string' ? body.token.trim() : '');
+
+                if (!isValidUidFormat(userId) || fcmToken.length < 10 || fcmToken.length > 4096 || /[\r\n\0]/.test(fcmToken)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'userIdまたはfcmTokenの形式が不正です' }));
+                    return true;
+                }
+
+                if (!token || !isValidSession(token, userId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによるFCM登録を拒絶: ${userId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
+
+                const sess = activeSessions.get(token) || verifyAndRestoreStatelessToken(token);
+                const sessEmail = (sess?.email || '').trim().toLowerCase();
+                if (reqEmail && sessEmail && reqEmail !== sessEmail) {
+                    console.warn(`[Security Block] FCM登録のメールアドレス不一致を拒絶: uid=${userId}`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アカウント情報がセッションと一致しません' }));
+                    return true;
+                }
+                const effEmail = sessEmail || reqEmail;
+
+                enforceMapSizeCap(fcmTokenStore, 5000);
+                fcmTokenStore.set(userId, { fcmToken, email: effEmail, updatedAt: Date.now() });
+                saveFcmTokens();
+                console.log(`[FCM Token] 登録成功: ${userId} (${maskEmail(effEmail)}) -> ${fcmToken.slice(0, 15)}...`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+                return true;
+            }
+            catch (err) {
+                console.error('[FCM Token Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'FCMトークン登録中にサーバーエラーが発生しました' }));
+                return true;
+            }
         }
+
+        return false;
     }
 
-    // [API 3] FCMデバイストークン登録: POST /api/user/fcm-token
-    if (req.method === 'POST' && url === '/api/user/fcm-token')
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const userId = (body.userId || '').trim();
-            const email = (body.email || '').trim().toLowerCase();
-            const fcmToken = (body.fcmToken || '').trim();
-            const token = extractBearerToken(req) || (body.token || '').trim();
+    module.exports = {
+        handleAuthRoutes
+    };
 
-            if (!userId || !fcmToken)
-            {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'userIdまたはfcmTokenが不正です' }));
-                return true;
-            }
-
-            if (!token || !isValidSession(token, userId))
-            {
-                console.warn(`[Security Block] 未認証または不正トークンによるFCM登録を拒絶: ${userId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-                return true;
-            }
-
-            enforceMapSizeCap(fcmTokenStore, 5000);
-            fcmTokenStore.set(userId, { fcmToken, email, updatedAt: Date.now() });
-            saveFcmTokens();
-            console.log(`[FCM Token] 登録成功: ${userId} (${email}) -> ${fcmToken.slice(0, 15)}...`);
-
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: true }));
-            return true;
-        }
-        catch (err)
-        {
-            console.error('[FCM Token Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
-        }
-    }
-
-    return false;
-}
-
-module.exports = {
-    handleAuthRoutes
-};
-
-return module.exports;
+    return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Module: ./modules/httpVaultRoutes.js] ====================
-__internalModules['./modules/httpVaultRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月14日 19時19分
-// [サーバーモジュール] 認証必須アカウントVaultプロキシ・鍵ラップシークレット配布・レガシーV3移行清掃HTTPルート
+__internalModules['./modules/httpVaultRoutes'] = (function (module, exports) {
+    // 変更日時：2026年11月14日 19時19分
+    // [サーバーモジュール] 認証必須アカウントVaultプロキシ・鍵ラップシークレット配布・レガシーV3移行清掃HTTPルート
 
-const {
-    ALLOWED_EMAIL_HASHES,
-    activeSessions,
-    vaultDataStore,
-    saveVaultDataStore,
-    getOrCreateVaultSecretB64,
-    ensureRemoteStoresLoaded,
-    isSupabaseServiceReady,
-    supabaseServiceUpsert,
-    supabaseServiceSelect,
-    supabaseServiceScrub,
-    enforceMapSizeCap,
-    isValidSession,
-    verifyAndRestoreStatelessToken,
-    extractBearerToken,
-    maskEmail,
-    sha256,
-    parseJsonBody
-} = __requireModule('./modules/stateStore');
+    const {
+        ALLOWED_EMAIL_HASHES,
+        activeSessions,
+        vaultDataStore,
+        saveVaultDataStore,
+        getOrCreateVaultSecretB64,
+        ensureRemoteStoresLoaded,
+        isSupabaseServiceReady,
+        supabaseServiceUpsert,
+        supabaseServiceSelect,
+        supabaseServiceScrub,
+        enforceMapSizeCap,
+        isValidSession,
+        verifyAndRestoreStatelessToken,
+        extractBearerToken,
+        maskEmail,
+        sha256,
+        parseJsonBody
+    } = __requireModule('./modules/stateStore');
 
-const MAX_VAULT_PAYLOAD_BYTES = 10 * 1024 * 1024;
+    const MAX_VAULT_PAYLOAD_BYTES = 10 * 1024 * 1024;
 
-// JSONレスポンス送信ヘルパー
-function sendJson(res, statusCode, payloadObj)
-{
-    res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify(payloadObj));
-}
+    // JSONレスポンス送信ヘルパー
+    function sendJson(res, statusCode, payloadObj) {
+        res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payloadObj));
+    }
 
-// セッション保有者・端末UID・メールアドレスの一致を検証
-function authenticateVaultRequest(req, res, requestedEmail, requestedDeviceUid)
-{
-    const token = extractBearerToken(req);
-    const cleanUid = (requestedDeviceUid || '').trim();
-    const cleanEmail = (requestedEmail || '').trim().toLowerCase();
+    // セッション保有者・端末UID・メールアドレスの一致を検証
+    function authenticateVaultRequest(req, res, requestedEmail, requestedDeviceUid) {
+        const token = extractBearerToken(req);
+        const cleanUid = (requestedDeviceUid || '').trim();
+        const cleanEmail = (requestedEmail || '').trim().toLowerCase();
 
-    if (!token || !cleanUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(cleanUid))
-    {
-        sendJson(res, 401, { success: false, error: '有効な認証セッションと端末UIDが必要です' });
+        if (!token || !cleanUid || !/^u_[a-zA-Z0-9]{8,40}$/.test(cleanUid)) {
+            sendJson(res, 401, { success: false, error: '有効な認証セッションと端末UIDが必要です' });
+            return null;
+        }
+
+        if (!isValidSession(token, cleanUid)) {
+            sendJson(res, 401, { success: false, error: '認証セッションが無効または期限切れです' });
+            return null;
+        }
+
+        const sess = activeSessions.get(token) || verifyAndRestoreStatelessToken(token);
+        if (!sess) {
+            sendJson(res, 401, { success: false, error: 'セッション情報を確認できませんでした' });
+            return null;
+        }
+
+        const sessEmail = (sess.email || '').trim().toLowerCase();
+        const emailToUse = cleanEmail || sessEmail;
+        const emailHash = sha256(emailToUse);
+        if (!emailToUse || !ALLOWED_EMAIL_HASHES.has(emailHash)) {
+            sendJson(res, 403, { success: false, error: 'アクセスが許可されていないアカウントです' });
+            return null;
+        }
+
+        const sessEmailHash = sess.emailHash || sha256(sessEmail);
+        if (!sessEmailHash || sessEmailHash !== emailHash) {
+            console.warn(`[Vault Auth Block] 他アカウントへのVaultアクセス試行を遮断: tokenEmail=${sessEmailHash.slice(0, 8)}, reqEmail=${emailHash.slice(0, 8)}`);
+            sendJson(res, 403, { success: false, error: '他アカウントのVaultにはアクセスできません' });
+            return null;
+        }
+
+        return { email: emailToUse, emailHash, deviceUid: cleanUid };
+    }
+
+    // Vault種別とハッシュから安全な永続レコードIDを生成
+    function resolveVaultRecordIds(vaultType, email, deviceUid) {
+        const cleanEmail = email.trim().toLowerCase();
+        if (vaultType === 'account') {
+            const accHash = sha256(`CELLPHONE_ACC_RECORD_V1:${cleanEmail}`).slice(0, 40);
+            return { v4Id: `cp_v4_acc_${accHash}`, legacyId: `cp_acc_${accHash}`, tag: 'acc_vault_v4' };
+        }
+        if (vaultType === 'chat') {
+            const chatHash = sha256(`CELLPHONE_CHAT_BACKUP_V1:${cleanEmail}`).slice(0, 40);
+            return { v4Id: `cp_v4_chat_${chatHash}`, legacyId: `cp_chat_${chatHash}`, tag: 'chat_vault_v4' };
+        }
+        if (vaultType === 'hardware') {
+            const hwHash = sha256(`CELLPHONE_HW_DIRECT_V4:${cleanEmail}:${deviceUid}`).slice(0, 40);
+            return { v4Id: `cp_v4_hw_${hwHash}`, legacyId: null, tag: 'hw_vault_v4' };
+        }
         return null;
     }
 
-    if (!isValidSession(token, cleanUid))
-    {
-        sendJson(res, 401, { success: false, error: '認証セッションが無効または期限切れです' });
-        return null;
+    // Vault暗号文の形式検証 (SEC-08対策: V3メール鍵データのV4領域混入をサーバー側でも防止)
+    function isAllowedCipherFormat(vaultType, payload) {
+        if (typeof payload !== 'string' || !payload || payload.length > MAX_VAULT_PAYLOAD_BYTES) {
+            return false;
+        }
+        if (vaultType === 'hardware') {
+            return payload.startsWith('ENC_HW_V1:') || payload.startsWith('ENC_BK_V4:');
+        }
+        return payload.startsWith('ENC_BK_V4:');
     }
 
-    const sess = activeSessions.get(token) || verifyAndRestoreStatelessToken(token);
-    if (!sess)
-    {
-        sendJson(res, 401, { success: false, error: 'セッション情報を確認できませんでした' });
-        return null;
-    }
+    // Vault・バックアッププロキシ系HTTPエンドポイントの処理
+    async function handleVaultRoutes(req, res, url) {
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(url, 'http://localhost');
+        }
+        catch (e) {
+            return false;
+        }
 
-    const sessEmail = (sess.email || '').trim().toLowerCase();
-    const emailToUse = cleanEmail || sessEmail;
-    const emailHash = sha256(emailToUse);
-    if (!emailToUse || !ALLOWED_EMAIL_HASHES.has(emailHash))
-    {
-        sendJson(res, 403, { success: false, error: 'アクセスが許可されていないアカウントです' });
-        return null;
-    }
+        const pathname = parsedUrl.pathname;
 
-    const sessEmailHash = sess.emailHash || sha256(sessEmail);
-    if (!sessEmailHash || sessEmailHash !== emailHash)
-    {
-        console.warn(`[Vault Auth Block] 他アカウントへのVaultアクセス試行を遮断: tokenEmail=${sessEmailHash.slice(0, 8)}, reqEmail=${emailHash.slice(0, 8)}`);
-        sendJson(res, 403, { success: false, error: '他アカウントのVaultにはアクセスできません' });
-        return null;
-    }
+        // [API Vault 1] 認証済みクライアント向けアカウント固有ラップシークレット取得
+        if (req.method === 'POST' && pathname === '/api/vault/wrap-key') {
+            try {
+                const body = await parseJsonBody(req);
+                const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
+                if (!auth) { return true; }
 
-    return { email: emailToUse, emailHash, deviceUid: cleanUid };
-}
+                const vaultSecretB64 = await getOrCreateVaultSecretB64(auth.email);
+                sendJson(res, 200, {
+                    success: true,
+                    vaultSecretB64,
+                    version: 4
+                });
+                return true;
+            }
+            catch (err) {
+                console.error('[Vault Wrap Key Error]', err.message);
+                sendJson(res, 500, { success: false, error: 'ラップ鍵の取得に失敗しました' });
+                return true;
+            }
+        }
 
-// Vault種別とハッシュから安全な永続レコードIDを生成
-function resolveVaultRecordIds(vaultType, email, deviceUid)
-{
-    const cleanEmail = email.trim().toLowerCase();
-    if (vaultType === 'account')
-    {
-        const accHash = sha256(`CELLPHONE_ACC_RECORD_V1:${cleanEmail}`).slice(0, 40);
-        return { v4Id: `cp_v4_acc_${accHash}`, legacyId: `cp_acc_${accHash}`, tag: 'acc_vault_v4' };
-    }
-    if (vaultType === 'chat')
-    {
-        const chatHash = sha256(`CELLPHONE_CHAT_BACKUP_V1:${cleanEmail}`).slice(0, 40);
-        return { v4Id: `cp_v4_chat_${chatHash}`, legacyId: `cp_chat_${chatHash}`, tag: 'chat_vault_v4' };
-    }
-    if (vaultType === 'hardware')
-    {
-        const hwHash = sha256(`CELLPHONE_HW_DIRECT_V4:${cleanEmail}:${deviceUid}`).slice(0, 40);
-        return { v4Id: `cp_v4_hw_${hwHash}`, legacyId: null, tag: 'hw_vault_v4' };
-    }
-    return null;
-}
+        // [API Vault 2] 暗号化Vault(ENC_BK_V4 / ENC_HW_V1)の保存: POST /api/vault/sync
+        if (req.method === 'POST' && pathname === '/api/vault/sync') {
+            try {
+                await ensureRemoteStoresLoaded();
+                const body = await parseJsonBody(req, MAX_VAULT_PAYLOAD_BYTES + 8192);
+                const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
+                if (!auth) { return true; }
 
-// Vault暗号文の形式検証 (SEC-08対策: V3メール鍵データのV4領域混入をサーバー側でも防止)
-function isAllowedCipherFormat(vaultType, payload)
-{
-    if (typeof payload !== 'string' || !payload || payload.length > MAX_VAULT_PAYLOAD_BYTES)
-    {
+                const vaultType = (body.vaultType || 'account').trim().toLowerCase();
+                const ids = resolveVaultRecordIds(vaultType, auth.email, auth.deviceUid);
+                if (!ids) {
+                    sendJson(res, 400, { success: false, error: '不正なvaultType指定です' });
+                    return true;
+                }
+
+                const encryptedPayload = typeof body.encryptedPayload === 'string' ? body.encryptedPayload.trim() : '';
+                if (!isAllowedCipherFormat(vaultType, encryptedPayload)) {
+                    sendJson(res, 400, { success: false, error: '不正または旧形式のVault暗号文は保存できません' });
+                    return true;
+                }
+
+                enforceMapSizeCap(vaultDataStore, 5000);
+                vaultDataStore.set(ids.v4Id, {
+                    tag: ids.tag,
+                    payload: encryptedPayload,
+                    updatedAt: Date.now()
+                });
+                saveVaultDataStore();
+
+                let remoteSaved = false;
+                if (isSupabaseServiceReady()) {
+                    remoteSaved = await supabaseServiceUpsert(ids.v4Id, ids.tag, encryptedPayload);
+                }
+
+                console.log(`[Vault Sync POST] ${vaultType}保存完了: ${maskEmail(auth.email)} (remote=${remoteSaved})`);
+                sendJson(res, 200, {
+                    success: true,
+                    recordId: ids.v4Id,
+                    remotePersisted: remoteSaved
+                });
+                return true;
+            }
+            catch (err) {
+                console.error('[Vault Sync POST Error]', err.message);
+                sendJson(res, 500, { success: false, error: 'Vault保存処理に失敗しました' });
+                return true;
+            }
+        }
+
+        // [API Vault 3] 暗号化Vault取得 (必要時は未移行レガシーV3も返す): GET /api/vault/sync
+        if (req.method === 'GET' && pathname === '/api/vault/sync') {
+            try {
+                await ensureRemoteStoresLoaded();
+                const reqEmail = parsedUrl.searchParams.get('email') || '';
+                const reqDeviceUid = parsedUrl.searchParams.get('deviceUid') || '';
+                const vaultType = (parsedUrl.searchParams.get('vaultType') || 'account').trim().toLowerCase();
+                const includeLegacy = parsedUrl.searchParams.get('includeLegacy') === '1';
+
+                const auth = authenticateVaultRequest(req, res, reqEmail, reqDeviceUid);
+                if (!auth) { return true; }
+
+                const ids = resolveVaultRecordIds(vaultType, auth.email, auth.deviceUid);
+                if (!ids) {
+                    sendJson(res, 400, { success: false, error: '不正なvaultType指定です' });
+                    return true;
+                }
+
+                const localRec = vaultDataStore.get(ids.v4Id);
+                let payload = localRec ? localRec.payload : null;
+                if (!payload && isSupabaseServiceReady()) {
+                    payload = await supabaseServiceSelect(ids.v4Id);
+                    if (payload) {
+                        enforceMapSizeCap(vaultDataStore, 5000);
+                        vaultDataStore.set(ids.v4Id, { tag: ids.tag, payload, updatedAt: Date.now() });
+                        saveVaultDataStore();
+                    }
+                }
+
+                let legacyPayload = null;
+                if (!payload && includeLegacy && ids.legacyId && isSupabaseServiceReady()) {
+                    const candidate = await supabaseServiceSelect(ids.legacyId);
+                    if (candidate && candidate.startsWith('ENC_BK_')) {
+                        legacyPayload = candidate;
+                    }
+                }
+
+                sendJson(res, 200, {
+                    success: true,
+                    recordId: ids.v4Id,
+                    payload: payload || null,
+                    legacyPayload: legacyPayload || null
+                });
+                return true;
+            }
+            catch (err) {
+                console.error('[Vault Sync GET Error]', err.message);
+                sendJson(res, 500, { success: false, error: 'Vault取得処理に失敗しました' });
+                return true;
+            }
+        }
+
+        // [API Vault 4] V4移行完了後の旧cp_acc_* / cp_chat_*レガシーデータ清掃
+        if (req.method === 'POST' && pathname === '/api/vault/legacy-scrub') {
+            try {
+                const body = await parseJsonBody(req);
+                const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
+                if (!auth) { return true; }
+
+                if (!isSupabaseServiceReady()) {
+                    sendJson(res, 200, { success: true, scrubFallbackOnClient: true });
+                    return true;
+                }
+
+                const accIds = resolveVaultRecordIds('account', auth.email, auth.deviceUid);
+                const chatIds = resolveVaultRecordIds('chat', auth.email, auth.deviceUid);
+                if (accIds && accIds.legacyId) {
+                    await supabaseServiceScrub(accIds.legacyId, '');
+                }
+                if (chatIds && chatIds.legacyId) {
+                    await supabaseServiceScrub(chatIds.legacyId, '');
+                }
+
+                console.log(`[Vault Scrub] レガシーV3データ清掃完了: ${maskEmail(auth.email)}`);
+                sendJson(res, 200, { success: true, scrubFallbackOnClient: false });
+                return true;
+            }
+            catch (err) {
+                console.error('[Vault Scrub Error]', err.message);
+                sendJson(res, 500, { success: false, error: 'レガシーVault清掃に失敗しました' });
+                return true;
+            }
+        }
+
         return false;
     }
-    if (vaultType === 'hardware')
-    {
-        return payload.startsWith('ENC_HW_V1:') || payload.startsWith('ENC_BK_V4:');
-    }
-    return payload.startsWith('ENC_BK_V4:');
-}
 
-// Vault・バックアッププロキシ系HTTPエンドポイントの処理
-async function handleVaultRoutes(req, res, url)
-{
-    let parsedUrl;
-    try
-    {
-        parsedUrl = new URL(url, 'http://localhost');
-    }
-    catch (e)
-    {
-        return false;
-    }
-
-    const pathname = parsedUrl.pathname;
-
-    // [API Vault 1] 認証済みクライアント向けアカウント固有ラップシークレット取得
-    if (req.method === 'POST' && pathname === '/api/vault/wrap-key')
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
-            if (!auth) { return true; }
-
-            const vaultSecretB64 = await getOrCreateVaultSecretB64(auth.email);
-            sendJson(res, 200, {
-                success: true,
-                vaultSecretB64,
-                version: 4
-            });
-            return true;
-        }
-        catch (err)
-        {
-            console.error('[Vault Wrap Key Error]', err.message);
-            sendJson(res, 500, { success: false, error: 'ラップ鍵の取得に失敗しました' });
-            return true;
-        }
-    }
-
-    // [API Vault 2] 暗号化Vault(ENC_BK_V4 / ENC_HW_V1)の保存: POST /api/vault/sync
-    if (req.method === 'POST' && pathname === '/api/vault/sync')
-    {
-        try
-        {
-            await ensureRemoteStoresLoaded();
-            const body = await parseJsonBody(req, MAX_VAULT_PAYLOAD_BYTES + 8192);
-            const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
-            if (!auth) { return true; }
-
-            const vaultType = (body.vaultType || 'account').trim().toLowerCase();
-            const ids = resolveVaultRecordIds(vaultType, auth.email, auth.deviceUid);
-            if (!ids)
-            {
-                sendJson(res, 400, { success: false, error: '不正なvaultType指定です' });
-                return true;
-            }
-
-            const encryptedPayload = typeof body.encryptedPayload === 'string' ? body.encryptedPayload.trim() : '';
-            if (!isAllowedCipherFormat(vaultType, encryptedPayload))
-            {
-                sendJson(res, 400, { success: false, error: '不正または旧形式のVault暗号文は保存できません' });
-                return true;
-            }
-
-            enforceMapSizeCap(vaultDataStore, 5000);
-            vaultDataStore.set(ids.v4Id, {
-                tag: ids.tag,
-                payload: encryptedPayload,
-                updatedAt: Date.now()
-            });
-            saveVaultDataStore();
-
-            let remoteSaved = false;
-            if (isSupabaseServiceReady())
-            {
-                remoteSaved = await supabaseServiceUpsert(ids.v4Id, ids.tag, encryptedPayload);
-            }
-
-            console.log(`[Vault Sync POST] ${vaultType}保存完了: ${maskEmail(auth.email)} (remote=${remoteSaved})`);
-            sendJson(res, 200, {
-                success: true,
-                recordId: ids.v4Id,
-                remotePersisted: remoteSaved
-            });
-            return true;
-        }
-        catch (err)
-        {
-            console.error('[Vault Sync POST Error]', err.message);
-            sendJson(res, 500, { success: false, error: 'Vault保存処理に失敗しました' });
-            return true;
-        }
-    }
-
-    // [API Vault 3] 暗号化Vault取得 (必要時は未移行レガシーV3も返す): GET /api/vault/sync
-    if (req.method === 'GET' && pathname === '/api/vault/sync')
-    {
-        try
-        {
-            await ensureRemoteStoresLoaded();
-            const reqEmail = parsedUrl.searchParams.get('email') || '';
-            const reqDeviceUid = parsedUrl.searchParams.get('deviceUid') || '';
-            const vaultType = (parsedUrl.searchParams.get('vaultType') || 'account').trim().toLowerCase();
-            const includeLegacy = parsedUrl.searchParams.get('includeLegacy') === '1';
-
-            const auth = authenticateVaultRequest(req, res, reqEmail, reqDeviceUid);
-            if (!auth) { return true; }
-
-            const ids = resolveVaultRecordIds(vaultType, auth.email, auth.deviceUid);
-            if (!ids)
-            {
-                sendJson(res, 400, { success: false, error: '不正なvaultType指定です' });
-                return true;
-            }
-
-            const localRec = vaultDataStore.get(ids.v4Id);
-            let payload = localRec ? localRec.payload : null;
-            if (!payload && isSupabaseServiceReady())
-            {
-                payload = await supabaseServiceSelect(ids.v4Id);
-                if (payload)
-                {
-                    enforceMapSizeCap(vaultDataStore, 5000);
-                    vaultDataStore.set(ids.v4Id, { tag: ids.tag, payload, updatedAt: Date.now() });
-                    saveVaultDataStore();
-                }
-            }
-
-            let legacyPayload = null;
-            if (!payload && includeLegacy && ids.legacyId && isSupabaseServiceReady())
-            {
-                const candidate = await supabaseServiceSelect(ids.legacyId);
-                if (candidate && candidate.startsWith('ENC_BK_'))
-                {
-                    legacyPayload = candidate;
-                }
-            }
-
-            sendJson(res, 200, {
-                success: true,
-                recordId: ids.v4Id,
-                payload: payload || null,
-                legacyPayload: legacyPayload || null
-            });
-            return true;
-        }
-        catch (err)
-        {
-            console.error('[Vault Sync GET Error]', err.message);
-            sendJson(res, 500, { success: false, error: 'Vault取得処理に失敗しました' });
-            return true;
-        }
-    }
-
-    // [API Vault 4] V4移行完了後の旧cp_acc_* / cp_chat_*レガシーデータ清掃
-    if (req.method === 'POST' && pathname === '/api/vault/legacy-scrub')
-    {
-        try
-        {
-            const body = await parseJsonBody(req);
-            const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
-            if (!auth) { return true; }
-
-            if (!isSupabaseServiceReady())
-            {
-                sendJson(res, 200, { success: true, scrubFallbackOnClient: true });
-                return true;
-            }
-
-            const accIds = resolveVaultRecordIds('account', auth.email, auth.deviceUid);
-            const chatIds = resolveVaultRecordIds('chat', auth.email, auth.deviceUid);
-            if (accIds && accIds.legacyId)
-            {
-                await supabaseServiceScrub(accIds.legacyId, '');
-            }
-            if (chatIds && chatIds.legacyId)
-            {
-                await supabaseServiceScrub(chatIds.legacyId, '');
-            }
-
-            console.log(`[Vault Scrub] レガシーV3データ清掃完了: ${maskEmail(auth.email)}`);
-            sendJson(res, 200, { success: true, scrubFallbackOnClient: false });
-            return true;
-        }
-        catch (err)
-        {
-            console.error('[Vault Scrub Error]', err.message);
-            sendJson(res, 500, { success: false, error: 'レガシーVault清掃に失敗しました' });
-            return true;
-        }
-    }
-
-    return false;
-}
-
-module.exports = { handleVaultRoutes };
+    module.exports = { handleVaultRoutes };
 
 
-return module.exports;
+    return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
-__internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月14日 19時20分
-// [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
+__internalModules['./modules/httpChatAndFileRoutes'] = (function (module, exports) {
+    // 変更日時：2026年11月16日 12時46分
+    // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
-const backupRateLimitMap = new Map(); // userId -> lastBackupTime
-const chatSendRateLimitMap = new Map(); // fromUserId -> lastSendTime (VULN-247是正)
+    const backupRateLimitMap = new Map(); // userId -> lastBackupTime
+    const inFlightUploadsByUid = new Map(); // uploaderUid -> { count, bytes } (SEC-05 TOCTOU対策)
 
-const WebSocket = require('ws');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const {
-    SERVER_DIR,
-    phoneStore,
-    fcmTokenStore,
-    activeSessions,
-    offlineMessageQueue,
-    offlineReadQueue,
-    attachmentAclStore,
-    recentChatPacketIds,
-    users,
-    enforceMapSizeCap,
-    isValidSession,
-    verifyAndRestoreStatelessToken,
-    extractBearerToken,
-    saveOfflineQueue,
-    saveOfflineReads,
-    saveAttachmentAcls,
-    profileStore,
-    saveProfiles,
-    isSupabaseServiceReady,
-    supabaseServiceUpsert,
-    supabaseServiceSelect,
-    parseJsonBody
-} = __requireModule('./modules/stateStore');
-const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
+    const WebSocket = require('ws');
+    const crypto = require('crypto');
+    const fs = require('fs');
+    const path = require('path');
+    const {
+        SERVER_DIR,
+        phoneStore,
+        fcmTokenStore,
+        activeSessions,
+        offlineMessageQueue,
+        offlineReadQueue,
+        attachmentAclStore,
+        recentChatPacketIds,
+        users,
+        enforceMapSizeCap,
+        isValidUidFormat,
+        isValidSession,
+        verifyAndRestoreStatelessToken,
+        extractBearerToken,
+        saveOfflineQueue,
+        saveOfflineReads,
+        enqueueOfflineRead,
+        isChatSendRateLimited,
+        saveAttachmentAcls,
+        profileStore,
+        saveProfiles,
+        isSupabaseServiceReady,
+        supabaseServiceUpsert,
+        supabaseServiceSelect,
+        parseJsonBody
+    } = __requireModule('./modules/stateStore');
+    const { sendChatMessagePush } = __requireModule('./modules/pushAndMail');
 
-const UPLOAD_DIR = path.join(SERVER_DIR, 'uploads');
+    const UPLOAD_DIR = path.join(SERVER_DIR, 'uploads');
 
-// チャットおよび暗号化ファイル系HTTPエンドポイントの処理 (処理した場合は true を返す)
-async function handleChatAndFileRoutes(req, res, url) {
-    // VULN-316是正: 不正URL例外によるプロセス即死(DoS)を防止
-    let parsedReqUrl;
-    try {
-        parsedReqUrl = new URL(url, 'http://localhost');
-    } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: '不正なURL形式です' }));
+    // プロフィール応答用の公開フィールド最小化ヘルパー (SEC-04 & SEC-10 v2署名互換)
+    function toPublicProfilePayload(prof, unchanged = null) {
+        const base = {
+            userId: prof.userId,
+            name: prof.name,
+            avatarEnc: unchanged ? null : prof.avatarEnc,
+            avatarHash: prof.avatarHash,
+            timestamp: prof.timestamp,
+            signature: prof.signature
+        };
+        if (prof.signatureV2) { base.signatureV2 = prof.signatureV2; }
+        if (unchanged !== null) { base.unchanged = unchanged; }
+        return base;
+    }
+
+    // 完了済み＋進行中アップロードの合算クォータ検証・予約 (SEC-05 TOCTOU対策)
+    function tryReserveUploadQuota(uploaderUid, contentLength = 0) {
+        if (!uploaderUid) { return true; }
+        let userFileCount = 0;
+        let userTotalBytes = 0;
+        for (const meta of attachmentAclStore.values()) {
+            if (meta.uploaderUid === uploaderUid) {
+                userFileCount++;
+                userTotalBytes += (meta.size || 0);
+            }
+        }
+        const flight = inFlightUploadsByUid.get(uploaderUid) || { count: 0, bytes: 0 };
+        const safeContentLen = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : 0;
+        if (flight.count >= 5 || (userFileCount + flight.count) >= 30) { return false; }
+        if ((userTotalBytes + flight.bytes + safeContentLen) > 300 * 1024 * 1024) { return false; }
+        enforceMapSizeCap(inFlightUploadsByUid, 2000);
+        inFlightUploadsByUid.set(uploaderUid, { count: flight.count + 1, bytes: flight.bytes });
         return true;
     }
 
-    // [API 4] 保留チャットメッセージ一括取得
-    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/pending') {
-        try {
-            const targetUserId = (parsedReqUrl.searchParams.get('userId') || '').trim();
-            const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
-
-            if (!targetUserId) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
-                return true;
-            }
-
-            if (!token || !isValidSession(token, targetUserId)) {
-                console.warn(`[Security Block] 未認証または不正トークンによる保留メッセージ取得を遮断: ${targetUserId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-                return true;
-            }
-
-            const messages = offlineMessageQueue.get(targetUserId) || [];
-            offlineMessageQueue.delete(targetUserId);
-            saveOfflineQueue();
-
-            const readReceipts = offlineReadQueue.get(targetUserId) || [];
-            offlineReadQueue.delete(targetUserId);
-            saveOfflineReads();
-
-            console.log(`[Chat Pending API] ${targetUserId} へ保留メッセージ ${messages.length}件、既読通知 ${readReceipts.length}バッチを一括返却・クリア`);
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({
-                success: true,
-                userId: targetUserId,
-                count: messages.length,
-                messages: messages,
-                readReceipts: readReceipts
-            }));
-            return true;
+    // 進行中アップロードのカウント・バイト加算解放
+    function releaseUploadQuota(uploaderUid, trackedBytes) {
+        if (!uploaderUid) { return; }
+        const flight = inFlightUploadsByUid.get(uploaderUid);
+        if (!flight) { return; }
+        const nextCount = Math.max(0, flight.count - 1);
+        const nextBytes = Math.max(0, flight.bytes - trackedBytes);
+        if (nextCount === 0) {
+            inFlightUploadsByUid.delete(uploaderUid);
+            return;
         }
-        catch (err) {
-            console.error('[Chat Pending API Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
-        }
+        inFlightUploadsByUid.set(uploaderUid, { count: nextCount, bytes: nextBytes });
     }
 
-    // [API 5] 既読通知受信: POST /api/chat/read
-    if (req.method === 'POST' && url === '/api/chat/read') {
+    // 進行中アップロードの実バイト累積と合算上限確認
+    function addInFlightUploadBytes(uploaderUid, deltaBytes) {
+        if (!uploaderUid) { return true; }
+        const flight = inFlightUploadsByUid.get(uploaderUid);
+        if (!flight) { return true; }
+        let completedBytes = 0;
+        for (const meta of attachmentAclStore.values()) {
+            if (meta.uploaderUid === uploaderUid) { completedBytes += (meta.size || 0); }
+        }
+        if ((completedBytes + flight.bytes + deltaBytes) > 300 * 1024 * 1024) { return false; }
+        flight.bytes += deltaBytes;
+        return true;
+    }
+
+    // チャットおよび暗号化ファイル系HTTPエンドポイントの処理 (処理した場合は true を返す)
+    async function handleChatAndFileRoutes(req, res, url) {
+        // VULN-316是正: 不正URL例外によるプロセス即死(DoS)を防止
+        let parsedReqUrl;
         try {
-            const body = await parseJsonBody(req);
-            const fromUserId = (body.fromUserId || '').trim();
-            const targetUserId = (body.targetUserId || '').trim();
-            const messageIds = Array.isArray(body.messageIds) ? body.messageIds : [];
-            const token = extractBearerToken(req) || (body.token || '').trim();
+            parsedReqUrl = new URL(url, 'http://localhost');
+        } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: '不正なURL形式です' }));
+            return true;
+        }
 
-            if (!fromUserId || !targetUserId || messageIds.length === 0) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
-                return true;
-            }
+        // [API 4] 保留チャットメッセージ一括取得
+        if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/pending') {
+            try {
+                const targetUserId = (parsedReqUrl.searchParams.get('userId') || '').trim();
+                const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
 
-            if (!token || !isValidSession(token, fromUserId)) {
-                console.warn(`[Security Block] 未認証または不正トークンによる既読送信を遮断: ${fromUserId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-                return true;
-            }
+                if (!targetUserId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
+                    return true;
+                }
 
-            const targetEntry = users.get(targetUserId);
-            let forwarded = false;
-            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                targetEntry.ws.send(JSON.stringify({
-                    type: 'chat_read',
-                    fromUserId: fromUserId,
-                    targetUserId: targetUserId,
-                    messageIds: messageIds
-                }));
-                forwarded = true;
-                console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS即時中継)`);
-            }
+                if (!token || !isValidSession(token, targetUserId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによる保留メッセージ取得を遮断: ${targetUserId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
 
-            if (!offlineReadQueue.has(targetUserId)) {
-                offlineReadQueue.set(targetUserId, []);
-            }
-            const rq = offlineReadQueue.get(targetUserId);
-            if (rq.length >= 300) {
-                console.warn(`[HTTP Chat Read Queue Warning] 既読キュー上限(300件)到達のため新規追加を遮断: target=${targetUserId}`);
-            } else {
-                rq.push({
-                    fromUserId: fromUserId,
-                    targetUserId: targetUserId,
-                    messageIds: messageIds,
-                    timestamp: Date.now()
-                });
+                const messages = offlineMessageQueue.get(targetUserId) || [];
+                offlineMessageQueue.delete(targetUserId);
+                saveOfflineQueue();
+
+                const readReceipts = offlineReadQueue.get(targetUserId) || [];
+                offlineReadQueue.delete(targetUserId);
                 saveOfflineReads();
-            }
-            console.log(`[HTTP Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー二重保持 (保留計: ${rq.length}件, WS即時=${forwarded})`);
 
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, forwarded: forwarded }));
-            return true;
+                console.log(`[Chat Pending API] ${targetUserId} へ保留メッセージ ${messages.length}件、既読通知 ${readReceipts.length}バッチを一括返却・クリア`);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({
+                    success: true,
+                    userId: targetUserId,
+                    count: messages.length,
+                    messages: messages,
+                    readReceipts: readReceipts
+                }));
+                return true;
+            }
+            catch (err) {
+                console.error('[Chat Pending API Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '保留メッセージ取得中にエラーが発生しました' }));
+                return true;
+            }
         }
-        catch (err) {
-            console.error('[HTTP Chat Read Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
+
+        // [API 5] 既読通知受信: POST /api/chat/read
+        if (req.method === 'POST' && url === '/api/chat/read') {
+            try {
+                const body = await parseJsonBody(req);
+                const fromUserId = (body.fromUserId || '').trim();
+                const targetUserId = (body.targetUserId || '').trim();
+                const messageIds = Array.isArray(body.messageIds) ? body.messageIds : [];
+                const token = extractBearerToken(req) || (body.token || '').trim();
+
+                if (!fromUserId || !targetUserId || messageIds.length === 0) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
+                    return true;
+                }
+
+                if (!token || !isValidSession(token, fromUserId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによる既読送信を遮断: ${fromUserId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
+
+                const targetEntry = users.get(targetUserId);
+                let forwarded = false;
+                if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                    targetEntry.ws.send(JSON.stringify({
+                        type: 'chat_read',
+                        fromUserId: fromUserId,
+                        targetUserId: targetUserId,
+                        messageIds: messageIds
+                    }));
+                    forwarded = true;
+                    console.log(`[HTTP Chat Read] ${fromUserId} が ${targetUserId} のメッセージ ${messageIds.length}件を既読 (WS即時中継)`);
+                }
+
+                const readRes = enqueueOfflineRead(fromUserId, targetUserId, messageIds);
+                if (!readRes.queued) {
+                    console.warn(`[HTTP Chat Read Queue Warning] 既読キュー上限(300件)到達のため新規追加を遮断: target=${targetUserId}`);
+                }
+                console.log(`[HTTP Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー二重保持 (保留計: ${readRes.size}件, WS即時=${forwarded})`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ success: true, forwarded: forwarded }));
+                return true;
+            }
+            catch (err) {
+                console.error('[HTTP Chat Read Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '既読通知処理中にエラーが発生しました' }));
+                return true;
+            }
         }
-    }
 
-    // [API 6] チャットメッセージ送信: POST /api/chat/send
-    if (req.method === 'POST' && url === '/api/chat/send') {
-        try {
-            // VULN-247是正: 許容サイズを512KBに制限
-            const data = await parseJsonBody(req, 512 * 1024);
-            const fromUserId = (data.fromUserId || '').trim();
-            const targetUserId = (data.targetUserId || data.targetId || '').trim();
-            const pktType = data.type || 'chat_message';
-            const isKeyPacket = (pktType === 'chat_key_ping' || pktType === 'chat_key_pong');
-            const token = extractBearerToken(req) || (data.token || '').trim();
+        // [API 6] チャットメッセージ送信: POST /api/chat/send
+        if (req.method === 'POST' && url === '/api/chat/send') {
+            try {
+                // VULN-247是正: 許容サイズを512KBに制限
+                const data = await parseJsonBody(req, 512 * 1024);
+                const fromUserId = (data.fromUserId || '').trim();
+                const targetUserId = (data.targetUserId || data.targetId || '').trim();
+                const pktType = data.type || 'chat_message';
+                const isKeyPacket = (pktType === 'chat_key_ping' || pktType === 'chat_key_pong');
+                const token = extractBearerToken(req) || (data.token || '').trim();
 
-            // VULN-244是正: パケットtypeの厳格なホワイトリスト検証
-            if (!['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(pktType)) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '不正なメッセージタイプです' }));
-                return true;
-            }
+                // VULN-244是正: パケットtypeの厳格なホワイトリスト検証
+                if (!['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(pktType)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '不正なメッセージタイプです' }));
+                    return true;
+                }
 
-            if (!fromUserId || !targetUserId || (!isKeyPacket && !data.messageId)) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
-                return true;
-            }
+                if (!fromUserId || !targetUserId || (!isKeyPacket && !data.messageId)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '引数が不足しています' }));
+                    return true;
+                }
 
-            if (!token || !isValidSession(token, fromUserId)) {
-                console.warn(`[Security Block] 未認証または不正トークンによるメッセージ送信を遮断: ${fromUserId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-                return true;
-            }
+                if (!token || !isValidSession(token, fromUserId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによるメッセージ送信を遮断: ${fromUserId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
 
-            // VULN-247是正: 送信者UIDごとのレートリミット (最大30件/秒)
-            const nowTime = Date.now();
-            const rateRecord = chatSendRateLimitMap.get(fromUserId) || { count: 0, resetAt: nowTime + 1000 };
-            if (nowTime > rateRecord.resetAt) {
-                rateRecord.count = 1;
-                rateRecord.resetAt = nowTime + 1000;
-            } else {
-                rateRecord.count++;
-                if (rateRecord.count > 30) {
+                // VULN-247是正: 送信者UIDごとの共通レートリミット (最大30件/秒)
+                if (isChatSendRateLimited(fromUserId)) {
                     res.writeHead(429, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: false, error: 'メッセージ送信頻度が高すぎます' }));
                     return true;
                 }
-            }
-            enforceMapSizeCap(chatSendRateLimitMap, 2000);
-            chatSendRateLimitMap.set(fromUserId, rateRecord);
 
-            // VULN-246是正: 宛先 targetUserId の実在・登録性検証 (未登録架空UID宛てのキュー攻撃を遮断)
-            const isTargetRegistered = users.has(targetUserId) ||
-                fcmTokenStore.has(targetUserId) ||
-                profileStore.has(targetUserId) ||
-                Array.from(phoneStore.values()).some(p => p.deviceUid === targetUserId);
-            if (!isTargetRegistered && !targetUserId.startsWith('bot_')) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '指定された宛先ユーザーが存在しません' }));
-                return true;
-            }
-
-            const targetEntry = users.get(targetUserId);
-            const senderName = users.get(fromUserId)?.name || '友だち';
-            const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
-            const dedupKey = data.messageId ? `${fromUserId}:${targetUserId}:${data.messageId}` : '';
-            const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
-            if (dedupKey) {
-                enforceMapSizeCap(recentChatPacketIds, 5000);
-                recentChatPacketIds.set(dedupKey, Date.now());
-            }
-
-            // VULN-244 & VULN-251是正: クライアント入力の未検証プロパティを除外し、安全なパケットのみ再構築
-            const safePacket = {
-                type: pktType,
-                fromUserId: fromUserId,
-                fromName: senderName,
-                targetUserId: targetUserId,
-                messageId: data.messageId || '',
-                subType: data.subType || '',
-                targetMessageId: data.targetMessageId || '',
-                text: typeof data.text === 'string' ? data.text.slice(0, 5000) : '',
-                iv: typeof data.iv === 'string' ? data.iv.slice(0, 128) : '',
-                cipher: typeof data.cipher === 'string' ? data.cipher.slice(0, 512 * 1024) : '',
-                senderPubKey: typeof data.senderPubKey === 'string' ? data.senderPubKey.slice(0, 512) : '',
-                senderPubSig: typeof data.senderPubSig === 'string' ? data.senderPubSig.slice(0, 512) : '',
-                timestamp: Number(data.timestamp) || Date.now()
-            };
-            if (data.imageBase64 && typeof data.imageBase64 === 'string' && data.imageBase64.length <= 512 * 1024) {
-                safePacket.imageBase64 = data.imageBase64;
-            }
-            if (data.fileUrl && typeof data.fileUrl === 'string' && data.fileUrl.length <= 512) {
-                safePacket.fileUrl = data.fileUrl;
-                safePacket.fileName = typeof data.fileName === 'string' ? data.fileName.slice(0, 128) : '';
-                safePacket.fileSize = Number(data.fileSize) || 0;
-            }
-
-            let sentViaWs = false;
-            if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                if (!alreadyProcessed) {
-                    targetEntry.ws.send(JSON.stringify(safePacket));
-                    console.log(`[HTTP Chat] Forwarded message from ${fromUserId} to ${targetUserId} via WebSocket (subType=${data.subType || 'normal'})`);
+                // VULN-246是正: 宛先 targetUserId の実在・登録性検証 (未登録架空UID宛てのキュー攻撃を遮断)
+                const isTargetRegistered = users.has(targetUserId) ||
+                    fcmTokenStore.has(targetUserId) ||
+                    profileStore.has(targetUserId) ||
+                    Array.from(phoneStore.values()).some(p => p.deviceUid === targetUserId);
+                if (!isTargetRegistered && !targetUserId.startsWith('bot_')) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '指定された宛先ユーザーが存在しません' }));
+                    return true;
                 }
-                sentViaWs = true;
-            }
 
-            // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
-            if (!sentViaWs || isMutation) {
-                if (!offlineMessageQueue.has(targetUserId)) {
-                    enforceMapSizeCap(offlineMessageQueue, 500);
-                    offlineMessageQueue.set(targetUserId, []);
+                const targetEntry = users.get(targetUserId);
+                const senderName = users.get(fromUserId)?.name || '友だち';
+                const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
+                const dedupKey = data.messageId ? `${fromUserId}:${targetUserId}:${data.messageId}` : '';
+                const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
+                if (dedupKey) {
+                    enforceMapSizeCap(recentChatPacketIds, 5000);
+                    recentChatPacketIds.set(dedupKey, Date.now());
                 }
-                const queue = offlineMessageQueue.get(targetUserId);
-                if (data.subType === 'unsend' && data.targetMessageId) {
-                    for (let i = queue.length - 1; i >= 0; i--) {
-                        if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === fromUserId) {
-                            queue.splice(i, 1);
-                        }
-                    }
-                }
-                else if (data.subType === 'edit' && data.targetMessageId) {
-                    for (let i = queue.length - 1; i >= 0; i--) {
-                        if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === fromUserId) {
-                            queue.splice(i, 1);
-                        }
-                    }
-                }
-                if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
-                    if (queue.length >= 100) {
-                        console.warn(`[HTTP Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
-                    } else {
-                        queue.push(safePacket);
-                        saveOfflineQueue();
-                        console.log(`[HTTP Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
-                    }
-                }
-            }
 
-            const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
-            if (!isKeyPacket && !alreadyProcessed && targetFcm && targetFcm.fcmToken) {
-                sendChatMessagePush(targetFcm.fcmToken, {
-                    subType: data.subType || '',
-                    targetMessageId: data.targetMessageId || '',
+                // VULN-244 & VULN-251是正: クライアント入力の未検証プロパティを除外し、安全なパケットのみ再構築
+                const safePacket = {
+                    type: pktType,
                     fromUserId: fromUserId,
                     fromName: senderName,
-                    messageId: data.messageId,
-                    text: data.text || '',
-                    iv: data.iv || '',
-                    cipher: data.cipher || '',
-                    // VULN-50是正: FCM 4KBペイロード制限超過を防ぐため生画像Base64を除外
-                    hasImage: data.imageBase64 ? 'true' : '',
-                    fileUrl: data.fileUrl || '',
-                    fileKey: '',
-                    fileName: data.fileName || '',
-                    fileSize: data.fileSize || '0',
-                    senderPubKey: data.senderPubKey || '',
-                    senderPubSig: data.senderPubSig || '',
-                    timestamp: data.timestamp || Date.now()
-                });
+                    targetUserId: targetUserId,
+                    messageId: data.messageId || '',
+                    subType: data.subType || '',
+                    targetMessageId: data.targetMessageId || '',
+                    text: typeof data.text === 'string' ? data.text.slice(0, 5000) : '',
+                    iv: typeof data.iv === 'string' ? data.iv.slice(0, 128) : '',
+                    cipher: typeof data.cipher === 'string' ? data.cipher.slice(0, 512 * 1024) : '',
+                    senderPubKey: typeof data.senderPubKey === 'string' ? data.senderPubKey.slice(0, 512) : '',
+                    senderPubSig: typeof data.senderPubSig === 'string' ? data.senderPubSig.slice(0, 512) : '',
+                    timestamp: Number(data.timestamp) || Date.now()
+                };
+                if (data.imageBase64 && typeof data.imageBase64 === 'string' && data.imageBase64.length <= 512 * 1024) {
+                    safePacket.imageBase64 = data.imageBase64;
+                }
+                if (data.fileUrl && typeof data.fileUrl === 'string' && data.fileUrl.length <= 512) {
+                    safePacket.fileUrl = data.fileUrl;
+                    safePacket.fileName = typeof data.fileName === 'string' ? data.fileName.slice(0, 128) : '';
+                    safePacket.fileSize = Number(data.fileSize) || 0;
+                }
+
+                let sentViaWs = false;
+                if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                    if (!alreadyProcessed) {
+                        targetEntry.ws.send(JSON.stringify(safePacket));
+                        console.log(`[HTTP Chat] Forwarded message from ${fromUserId} to ${targetUserId} via WebSocket (subType=${data.subType || 'normal'})`);
+                    }
+                    sentViaWs = true;
+                }
+
+                // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
+                if (!sentViaWs || isMutation) {
+                    if (!offlineMessageQueue.has(targetUserId)) {
+                        enforceMapSizeCap(offlineMessageQueue, 500);
+                        offlineMessageQueue.set(targetUserId, []);
+                    }
+                    const queue = offlineMessageQueue.get(targetUserId);
+                    if (data.subType === 'unsend' && data.targetMessageId) {
+                        for (let i = queue.length - 1; i >= 0; i--) {
+                            if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === fromUserId) {
+                                queue.splice(i, 1);
+                            }
+                        }
+                    }
+                    else if (data.subType === 'edit' && data.targetMessageId) {
+                        for (let i = queue.length - 1; i >= 0; i--) {
+                            if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === fromUserId) {
+                                queue.splice(i, 1);
+                            }
+                        }
+                    }
+                    if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
+                        if (queue.length >= 100) {
+                            console.warn(`[HTTP Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
+                        } else {
+                            queue.push(safePacket);
+                            saveOfflineQueue();
+                            console.log(`[HTTP Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
+                        }
+                    }
+                }
+
+                const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get(targetUserId.trim());
+                if (!isKeyPacket && !alreadyProcessed && targetFcm && targetFcm.fcmToken) {
+                    sendChatMessagePush(targetFcm.fcmToken, {
+                        subType: data.subType || '',
+                        targetMessageId: data.targetMessageId || '',
+                        fromUserId: fromUserId,
+                        fromName: senderName,
+                        messageId: data.messageId,
+                        text: data.text || '',
+                        iv: data.iv || '',
+                        cipher: data.cipher || '',
+                        // VULN-50是正: FCM 4KBペイロード制限超過を防ぐため生画像Base64を除外
+                        hasImage: data.imageBase64 ? 'true' : '',
+                        fileUrl: data.fileUrl || '',
+                        fileKey: '',
+                        fileName: data.fileName || '',
+                        fileSize: data.fileSize || '0',
+                        senderPubKey: data.senderPubKey || '',
+                        senderPubSig: data.senderPubSig || '',
+                        timestamp: data.timestamp || Date.now()
+                    });
+                }
+
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ success: true, messageId: data.messageId, sentViaWs: sentViaWs }));
+                return true;
             }
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, messageId: data.messageId, sentViaWs: sentViaWs }));
-            return true;
+            catch (err) {
+                console.error('[HTTP Chat Send API Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'メッセージ送信中にエラーが発生しました' }));
+                return true;
+            }
         }
-        catch (err) {
-            console.error('[HTTP Chat Send API Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
-        }
-    }
 
-    // [API 7] 暗号化ファイル直接アップロード: POST /api/file/upload (No.11: ACL記録＆UID別クォータ制限)
-    if (req.method === 'POST' && url === '/api/file/upload') {
-        try {
+        // [API 7] 暗号化ファイル直接アップロード: POST /api/file/upload (No.11: ACL記録＆UID別クォータ制限)
+        if (req.method === 'POST' && url === '/api/file/upload') {
+            try {
+                const token = extractBearerToken(req);
+                if (!token || !isValidSession(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
+
+                // VULN-61是正: サーバー再起動後のステートレストークン復旧を厳格化
+                let session = activeSessions.get(token);
+                if (!session && token.startsWith('st1.')) {
+                    session = verifyAndRestoreStatelessToken(token);
+                }
+                const uploaderUid = (session?.deviceUid || '').trim();
+                const targetUid = (req.headers['x-target-uid'] || '').trim();
+
+                // VULN-65是正: 送信先UID (X-Target-Uid) の必須・正規フォーマット検証
+                if (!targetUid || !/^(u_[a-zA-Z0-9]{8,40}|bot_[a-zA-Z0-9_]{3,30})$/.test(targetUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '送信先UID (X-Target-Uid) が未指定または不正な形式です' }));
+                    return true;
+                }
+
+                // 1ユーザーあたりの同時並行＆完了済み保持上限検査 (SEC-05 TOCTOU対策)
+                const expectedLen = Number(req.headers['content-length']) || 0;
+                if (!tryReserveUploadQuota(uploaderUid, expectedLen)) {
+                    res.writeHead(429, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '一時ファイル保持上限または同時アップロード上限に達しました' }));
+                    return true;
+                }
+
+                if (!fs.existsSync(UPLOAD_DIR)) {
+                    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+                }
+
+                const fileId = 'enc_' + crypto.randomBytes(16).toString('hex');
+                const savePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
+                const writeStream = fs.createWriteStream(savePath, { mode: 0o600 });
+
+                let uploadedBytes = 0;
+                let trackedInFlightBytes = 0;
+                let quotaReleased = false;
+                let isAborted = false;
+                const maxLimit = 150 * 1024 * 1024;
+
+                const releaseQuotaOnce = () => {
+                    if (quotaReleased) { return; }
+                    quotaReleased = true;
+                    releaseUploadQuota(uploaderUid, trackedInFlightBytes);
+                };
+
+                // VULN-71是正: アップロード中断時の一時ファイル自動クリーンアップ (Disk Full DoS完全遮断)
+                const cleanupIncompleteFile = () => {
+                    releaseQuotaOnce();
+                    if (writeStream.writableEnded || writeStream.destroyed) { return; }
+                    isAborted = true;
+                    req.unpipe(writeStream);
+                    writeStream.destroy();
+                    try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
+                    console.warn(`[File Upload Aborted] クライアント切断による不完全ファイルを安全消去: ${fileId}`);
+                };
+                req.on('close', () => {
+                    if (!writeStream.writableFinished && !writeStream.writableEnded) {
+                        cleanupIncompleteFile();
+                    }
+                });
+                req.on('aborted', cleanupIncompleteFile);
+
+                req.on('data', (chunk) => {
+                    if (isAborted) { return; }
+                    uploadedBytes += chunk.length;
+                    if (uploadedBytes > maxLimit || !addInFlightUploadBytes(uploaderUid, chunk.length)) {
+                        cleanupIncompleteFile();
+                        if (!res.headersSent) {
+                            const code = uploadedBytes > maxLimit ? 413 : 429;
+                            res.writeHead(code, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: 'ファイルサイズまたは合計保持容量が上限を超えています' }));
+                        }
+                        req.destroy();
+                        return;
+                    }
+                    trackedInFlightBytes += chunk.length;
+                });
+
+                req.pipe(writeStream);
+
+                writeStream.on('finish', () => {
+                    releaseQuotaOnce();
+                    if (isAborted || res.headersSent) { return; }
+                    enforceMapSizeCap(attachmentAclStore, 2000);
+                    attachmentAclStore.set(fileId, {
+                        uploaderUid: uploaderUid,
+                        targetUid: targetUid,
+                        size: uploadedBytes,
+                        createdAt: Date.now()
+                    });
+                    // VULN-62是正: アップロード完了時にACLストアを即時暗号化永続化 (サーバー再起動後のDL不能・403拒絶を完全防止)
+                    saveAttachmentAcls();
+                    // VULN-54是正: Host Header Poisoning / SSRF 誘発完全防御 (信頼済みドメインのみ許可)
+                    const rawHost = (req.headers['host'] || '').trim().toLowerCase();
+                    const isTrustedHost = rawHost === 'cellphone-signaling-server.onrender.com' ||
+                        rawHost.startsWith('localhost:') || rawHost === 'localhost' ||
+                        rawHost.startsWith('127.0.0.1:') || rawHost === '127.0.0.1';
+                    const safeHost = isTrustedHost ? rawHost : 'cellphone-signaling-server.onrender.com';
+                    const rawProto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+                    const protocol = (rawProto === 'https' || rawProto === 'http') ? rawProto : 'https';
+                    const downloadUrl = `${protocol}://${safeHost}/api/file/download/${fileId}`;
+                    console.log(`[File Upload] 暗号化ファイルを正常保管: ${fileId} (${uploadedBytes} bytes, from=${uploaderUid}, to=${targetUid || 'any'})`);
+                    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                    res.end(JSON.stringify({
+                        success: true,
+                        fileId: fileId,
+                        url: downloadUrl,
+                        size: uploadedBytes
+                    }));
+                });
+
+                writeStream.on('error', (err) => {
+                    releaseQuotaOnce();
+                    if (isAborted || res.headersSent) { return; }
+                    isAborted = true;
+                    console.error('[File Upload Error]', err);
+                    try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'ファイル書き込み中にエラーが発生しました' }));
+                });
+                return true;
+            }
+            catch (err) {
+                console.error('[File Upload Exception]', err);
+                if (!res.headersSent) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アップロード処理中にエラーが発生しました' }));
+                }
+                return true;
+            }
+        }
+
+        // [API 8] 暗号化ファイル直接ダウンロード: GET /api/file/download/*
+        if (req.method === 'GET' && url.startsWith('/api/file/download/')) {
             const token = extractBearerToken(req);
             if (!token || !isValidSession(token)) {
                 res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -2978,1150 +2951,1040 @@ async function handleChatAndFileRoutes(req, res, url) {
                 return true;
             }
 
-            // VULN-61是正: サーバー再起動後のステートレストークン復旧を厳格化
+            const urlPath = url.split('?')[0];
+            const fileId = path.basename(urlPath);
+            if (!/^enc_[a-f0-9]{32}$/.test(fileId)) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: '無効なファイル識別子です' }));
+                return true;
+            }
+
+            // VULN-04 & VULN-28 是正: 送信者または指定受信者以外の第三者によるダウンロード(IDOR)を完全遮断
             let session = activeSessions.get(token);
             if (!session && token.startsWith('st1.')) {
                 session = verifyAndRestoreStatelessToken(token);
             }
-            const uploaderUid = (session?.deviceUid || '').trim();
-            const targetUid = (req.headers['x-target-uid'] || '').trim();
-
-            // VULN-65是正: 送信先UID (X-Target-Uid) の必須・正規フォーマット検証
-            if (!targetUid || !/^(u_[a-zA-Z0-9]{8,40}|bot_[a-zA-Z0-9_]{3,30})$/.test(targetUid)) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '送信先UID (X-Target-Uid) が未指定または不正な形式です' }));
-                return true;
-            }
-
-            // 1ユーザーあたりの同時保持ファイル数・合計容量クォータ検証 (最大30ファイルまたは300MBまで)
-            if (uploaderUid) {
-                let userFileCount = 0;
-                let userTotalBytes = 0;
-                for (const meta of attachmentAclStore.values()) {
-                    if (meta.uploaderUid === uploaderUid) {
-                        userFileCount++;
-                        userTotalBytes += (meta.size || 0);
-                    }
+            const requesterUid = (session?.deviceUid || '').trim();
+            const acl = attachmentAclStore.get(fileId);
+            if (acl) {
+                if (!requesterUid) {
+                    console.warn(`[Security Block] 未認証またはUID特定不能なダウンロード要求を遮断: ${fileId}`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アクセス権限がありません' }));
+                    return true;
                 }
-                if (userFileCount >= 30 || userTotalBytes > 300 * 1024 * 1024) {
-                    res.writeHead(429, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ success: false, error: '一時ファイル保持上限に達しました。しばらく待ってから再試行してください' }));
+                const isUploader = (acl.uploaderUid && requesterUid === acl.uploaderUid);
+                const isTarget = (acl.targetUid && requesterUid === acl.targetUid);
+                if (!isUploader && !isTarget) {
+                    console.warn(`[Security Block] 権限のないユーザー(${requesterUid})による添付ファイル(${fileId})取得を遮断 (uploader=${acl.uploaderUid}, target=${acl.targetUid})`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'このファイルへのアクセス権限がありません' }));
                     return true;
                 }
             }
-
-            if (!fs.existsSync(UPLOAD_DIR)) {
-                fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+            else {
+                console.warn(`[Security Block] ACL情報が存在しない添付ファイル(${fileId})へのダウンロード要求を安全のため遮断`);
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'ファイルのアクセス権限が見つかりません' }));
+                return true;
             }
 
-            const fileId = 'enc_' + crypto.randomBytes(16).toString('hex');
-            const savePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
-            const writeStream = fs.createWriteStream(savePath, { mode: 0o600 });
+            const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
+            if (!fs.existsSync(filePath)) {
+                res.writeHead(404, { 'Content-Type': 'text/plain' });
+                res.end('File not found or expired');
+                return true;
+            }
 
-            let uploadedBytes = 0;
-            let isAborted = false;
-            const maxLimit = 150 * 1024 * 1024;
-
-            // VULN-71是正: アップロード中断時の一時ファイル自動クリーンアップ (Disk Full DoS完全遮断)
-            const cleanupIncompleteFile = () => {
-                if (writeStream.writableEnded || writeStream.destroyed) { return; }
-                isAborted = true;
-                req.unpipe(writeStream);
-                writeStream.destroy();
-                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
-                console.warn(`[File Upload Aborted] クライアント切断による不完全ファイルを安全消去: ${fileId}`);
-            };
+            const stat = fs.statSync(filePath);
+            res.writeHead(200, {
+                'Content-Type': 'application/octet-stream',
+                'Content-Length': stat.size,
+                'Content-Disposition': `attachment; filename="${fileId}.bin"`,
+                'Cache-Control': 'no-cache'
+            });
+            const readStream = fs.createReadStream(filePath);
+            // VULN-321是正: ストリームerrorイベント捕捉によるプロセスクラッシュ防止
+            readStream.on('error', (err) => {
+                console.error('[File Download Stream Error]', err);
+                readStream.destroy();
+                if (!res.headersSent) {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    res.end('Download error');
+                }
+            });
+            // VULN-51是正: クライアント切断時にストリームを即座に破棄しリソースリークを完全防止
             req.on('close', () => {
-                if (!writeStream.writableFinished && !writeStream.writableEnded) {
-                    cleanupIncompleteFile();
-                }
+                readStream.destroy();
             });
-            req.on('aborted', cleanupIncompleteFile);
+            readStream.pipe(res);
+            return true;
+        }
 
-            req.on('data', (chunk) => {
-                if (isAborted) { return; }
-                uploadedBytes += chunk.length;
-                if (uploadedBytes > maxLimit) {
-                    cleanupIncompleteFile();
-                    if (!res.headersSent) {
-                        res.writeHead(413, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: false, error: 'ファイルサイズが上限(150MB)を超えています' }));
+
+        // [API 8] テキスト会話履歴バックアップ保存: POST /api/chat/backup
+        if (req.method === 'POST' && url === '/api/chat/backup') {
+            try {
+                // VULN-318是正: 25MBパース前にヘッダーBearerトークンとセッションを先行検証
+                const token = extractBearerToken(req);
+                if (!token || !isValidSession(token)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
+                    return true;
+                }
+
+                // VULN-72是正: メモリ枯渇DoS(OOM)防止のため最大上限を25MBに適正化
+                const data = await parseJsonBody(req, 25 * 1024 * 1024);
+                const userId = (data.userId || '').trim();
+                const backupData = data.backupData;
+
+                if (!userId || typeof backupData !== 'string' || !backupData) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '引数が不足または型が不正です' }));
+                    return true;
+                }
+
+                if (!isValidSession(token, userId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによるバックアップ保存要求を遮断: ${userId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
+
+                // VULN-60是正: 連続バックアップ要求(レートリミット30秒制限)によるディスクI/O枯渇攻撃を遮断
+                const nowTime = Date.now();
+                const lastBackupTime = backupRateLimitMap.get(userId) || 0;
+                if (nowTime - lastBackupTime < 30000) {
+                    console.warn(`[Security Block] バックアップAPIレートリミット検知: ${userId} (${nowTime - lastBackupTime}ms経過)`);
+                    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                    res.end(JSON.stringify({ success: true, timestamp: lastBackupTime, rateLimited: true }));
+                    return true;
+                }
+                backupRateLimitMap.set(userId, nowTime);
+                if (backupRateLimitMap.size > 1000) {
+                    const firstKey = backupRateLimitMap.keys().next().value;
+                    backupRateLimitMap.delete(firstKey);
+                }
+
+                // VULN-72是正: 25MB超過の巨大ペイロードによるメモリ枯渇DoS攻撃を遮断
+                if (backupData.length > 25 * 1024 * 1024) {
+                    console.warn(`[Security Block] バックアップデータサイズ上限(25MB)超過を遮断: ${userId}`);
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'バックアップサイズが上限(25MB)を超えています' }));
+                    return true;
+                }
+
+                // VULN-317是正: SERVER_DIR基準の安全なパス解決 (親ディレクトリ脱出を完全防止)
+                const backupDir = path.join(SERVER_DIR, 'backups');
+                if (!fs.existsSync(backupDir)) { fs.mkdirSync(backupDir, { recursive: true }); }
+                const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
+
+                // VULN-58是正: ディレクトリトラバーサル境界検証
+                if (!targetFile.startsWith(backupDir + path.sep)) {
+                    console.warn(`[Security Block] 不正なバックアップパス(パストラバーサル)を遮断: ${userId}`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
+                    return true;
+                }
+
+                // VULN-72是正: イベントループブロッキング防止のため非同期fs.promises.writeFileを使用
+                await fs.promises.writeFile(targetFile, backupData, 'utf8');
+                if (isSupabaseServiceReady()) {
+                    await supabaseServiceUpsert(`cp_srv_chat_${safeUserId}`, 'chat_backup_srv', backupData);
+                }
+                console.log(`[Chat Backup] 会話履歴バックアップ保存成功: ${userId} (サイズ: ${backupData.length} chars)`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ success: true, timestamp: Date.now() }));
+                return true;
+            }
+            catch (err) {
+                console.error('[Chat Backup Error]', err);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'バックアップ保存中にエラーが発生しました' }));
+                return true;
+            }
+        }
+
+        // [API 9] テキスト会話履歴バックアップ取得(復元用): GET /api/chat/backup
+        if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/backup') {
+            try {
+                const userId = (parsedReqUrl.searchParams.get('userId') || '').trim();
+                const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
+
+                if (!userId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
+                    return true;
+                }
+
+                if (!token || !isValidSession(token, userId)) {
+                    console.warn(`[Security Block] 未認証または不正トークンによるバックアップ取得要求を遮断: ${userId}`);
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
+
+                // VULN-317是正: SERVER_DIR基準の安全なパス解決
+                const backupDir = path.join(SERVER_DIR, 'backups');
+                const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '_');
+                const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
+
+                // VULN-58是正: ディレクトリトラバーサル境界検証
+                if (!targetFile.startsWith(backupDir + path.sep)) {
+                    console.warn(`[Security Block] 不正なバックアップ取得パスを遮断: ${userId}`);
+                    res.writeHead(403, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
+                    return true;
+                }
+
+                let backupData = null;
+                let timestamp = Date.now();
+                if (fs.existsSync(targetFile)) {
+                    // VULN-72是正: 非同期fs.promises.readFileおよびstatによるイベントループ保護
+                    backupData = await fs.promises.readFile(targetFile, 'utf8');
+                    const stat = await fs.promises.stat(targetFile);
+                    timestamp = stat.mtimeMs;
+                }
+                else if (isSupabaseServiceReady()) {
+                    backupData = await supabaseServiceSelect(`cp_srv_chat_${safeUserId}`);
+                    if (backupData) {
+                        await fs.promises.mkdir(backupDir, { recursive: true });
+                        await fs.promises.writeFile(targetFile, backupData, 'utf8');
                     }
-                    req.destroy();
                 }
-            });
 
-            req.pipe(writeStream);
+                if (!backupData) {
+                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'バックアップが存在しません' }));
+                    return true;
+                }
 
-            writeStream.on('finish', () => {
-                if (isAborted || res.headersSent) { return; }
-                enforceMapSizeCap(attachmentAclStore, 2000);
-                attachmentAclStore.set(fileId, {
-                    uploaderUid: uploaderUid,
-                    targetUid: targetUid,
-                    size: uploadedBytes,
-                    createdAt: Date.now()
-                });
-                // VULN-62是正: アップロード完了時にACLストアを即時暗号化永続化 (サーバー再起動後のDL不能・403拒絶を完全防止)
-                saveAttachmentAcls();
-                // VULN-54是正: Host Header Poisoning / SSRF 誘発完全防御 (信頼済みドメインのみ許可)
-                const rawHost = (req.headers['host'] || '').trim().toLowerCase();
-                const isTrustedHost = rawHost === 'cellphone-signaling-server.onrender.com' ||
-                    rawHost.startsWith('localhost:') || rawHost === 'localhost' ||
-                    rawHost.startsWith('127.0.0.1:') || rawHost === '127.0.0.1';
-                const safeHost = isTrustedHost ? rawHost : 'cellphone-signaling-server.onrender.com';
-                const rawProto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-                const protocol = (rawProto === 'https' || rawProto === 'http') ? rawProto : (req.socket.encrypted ? 'https' : 'https');
-                const downloadUrl = `${protocol}://${safeHost}/api/file/download/${fileId}`;
-                console.log(`[File Upload] 暗号化ファイルを正常保管: ${fileId} (${uploadedBytes} bytes, from=${uploaderUid}, to=${targetUid || 'any'})`);
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
                 res.end(JSON.stringify({
                     success: true,
-                    fileId: fileId,
-                    url: downloadUrl,
-                    size: uploadedBytes
+                    userId: userId,
+                    timestamp: timestamp,
+                    backupData: backupData
                 }));
-            });
-
-            writeStream.on('error', (err) => {
-                if (isAborted || res.headersSent) { return; }
-                isAborted = true;
-                console.error('[File Upload Error]', err);
-                try { if (fs.existsSync(savePath)) { fs.unlinkSync(savePath); } } catch (e) { }
+                return true;
+            }
+            catch (err) {
+                console.error('[Chat Restore Error]', err);
                 res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'ファイル書き込みエラー: ' + err.message }));
-            });
-            return true;
-        }
-        catch (err) {
-            console.error('[File Upload Exception]', err);
-            if (!res.headersSent) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: err.message }));
-            }
-            return true;
-        }
-    }
-
-    // [API 8] 暗号化ファイル直接ダウンロード: GET /api/file/download/*
-    if (req.method === 'GET' && url.startsWith('/api/file/download/')) {
-        const token = extractBearerToken(req);
-        if (!token || !isValidSession(token)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-            return true;
-        }
-
-        const urlPath = url.split('?')[0];
-        const fileId = path.basename(urlPath);
-        if (!/^enc_[a-f0-9]{32}$/.test(fileId)) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: '無効なファイル識別子です' }));
-            return true;
-        }
-
-        // VULN-04 & VULN-28 是正: 送信者または指定受信者以外の第三者によるダウンロード(IDOR)を完全遮断
-        let session = activeSessions.get(token);
-        if (!session && token.startsWith('st1.')) {
-            session = verifyAndRestoreStatelessToken(token);
-        }
-        const requesterUid = (session?.deviceUid || '').trim();
-        const acl = attachmentAclStore.get(fileId);
-        if (acl) {
-            if (!requesterUid) {
-                console.warn(`[Security Block] 未認証またはUID特定不能なダウンロード要求を遮断: ${fileId}`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'アクセス権限がありません' }));
-                return true;
-            }
-            const isUploader = (acl.uploaderUid && requesterUid === acl.uploaderUid);
-            const isTarget = (acl.targetUid && requesterUid === acl.targetUid);
-            if (!isUploader && !isTarget) {
-                console.warn(`[Security Block] 権限のないユーザー(${requesterUid})による添付ファイル(${fileId})取得を遮断 (uploader=${acl.uploaderUid}, target=${acl.targetUid})`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'このファイルへのアクセス権限がありません' }));
+                res.end(JSON.stringify({ success: false, error: 'バックアップ取得中にエラーが発生しました' }));
                 return true;
             }
         }
-        else {
-            console.warn(`[Security Block] ACL情報が存在しない添付ファイル(${fileId})へのダウンロード要求を安全のため遮断`);
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: 'ファイルのアクセス権限が見つかりません' }));
-            return true;
-        }
-
-        const filePath = path.join(UPLOAD_DIR, `${fileId}.bin`);
-        if (!fs.existsSync(filePath)) {
-            res.writeHead(404, { 'Content-Type': 'text/plain' });
-            res.end('File not found or expired');
-            return true;
-        }
-
-        const stat = fs.statSync(filePath);
-        res.writeHead(200, {
-            'Content-Type': 'application/octet-stream',
-            'Content-Length': stat.size,
-            'Content-Disposition': `attachment; filename="${fileId}.bin"`,
-            'Cache-Control': 'no-cache'
-        });
-        const readStream = fs.createReadStream(filePath);
-        // VULN-321是正: ストリームerrorイベント捕捉によるプロセスクラッシュ防止
-        readStream.on('error', (err) => {
-            console.error('[File Download Stream Error]', err);
-            readStream.destroy();
-            if (!res.headersSent) {
-                res.writeHead(500, { 'Content-Type': 'text/plain' });
-                res.end('Download error');
-            }
-        });
-        // VULN-51是正: クライアント切断時にストリームを即座に破棄しリソースリークを完全防止
-        req.on('close', () => {
-            readStream.destroy();
-        });
-        readStream.pipe(res);
-        return true;
-    }
 
 
-    // [API 8] テキスト会話履歴バックアップ保存: POST /api/chat/backup
-    if (req.method === 'POST' && url === '/api/chat/backup') {
-        try {
-            // VULN-318是正: 25MBパース前にヘッダーBearerトークンとセッションを先行検証
-            const token = extractBearerToken(req);
-            if (!token || !isValidSession(token)) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効または未指定です' }));
-                return true;
-            }
+        // [API 10] プロフィール更新 (暗号化アバター・名前のサーバー安全保管)
+        if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/update') {
+            try {
+                const token = extractBearerToken(req);
+                const body = await parseJsonBody(req);
+                const userId = (body.userId || '').trim();
+                const name = (body.name || '').trim();
+                const avatarEnc = (body.avatarEnc || '').trim();
+                const avatarHash = (body.avatarHash || '').trim();
+                const timestamp = Number(body.timestamp) || Date.now();
+                const signature = (body.signature || '').trim();
+                const signatureV2 = typeof body.signatureV2 === 'string' ? body.signatureV2.trim().slice(0, 512) : '';
 
-            // VULN-72是正: メモリ枯渇DoS(OOM)防止のため最大上限を25MBに適正化
-            const data = await parseJsonBody(req, 25 * 1024 * 1024);
-            const userId = (data.userId || '').trim();
-            const backupData = data.backupData;
+                if (!userId || !token || !isValidSession(token, userId)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
 
-            if (!userId || typeof backupData !== 'string' || !backupData) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '引数が不足または型が不正です' }));
-                return true;
-            }
+                if (!name && !avatarEnc && !avatarHash) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '更新データがありません' }));
+                    return true;
+                }
 
-            if (!isValidSession(token, userId)) {
-                console.warn(`[Security Block] 未認証または不正トークンによるバックアップ保存要求を遮断: ${userId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
-                return true;
-            }
+                // VULN-250是正: アバター暗号文サイズ上限(512KB)の厳格検査
+                if (avatarEnc && avatarEnc.length > 512 * 1024) {
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'アバターデータサイズが上限(512KB)を超えています' }));
+                    return true;
+                }
 
-            // VULN-60是正: 連続バックアップ要求(レートリミット30秒制限)によるディスクI/O枯渇攻撃を遮断
-            const nowTime = Date.now();
-            const lastBackupTime = backupRateLimitMap.get(userId) || 0;
-            if (nowTime - lastBackupTime < 30000) {
-                console.warn(`[Security Block] バックアップAPIレートリミット検知: ${userId} (${nowTime - lastBackupTime}ms経過)`);
+                const existing = profileStore.get(userId) || {};
+                // VULN-322是正: 空文字指定による既存アバターのサイレント消去バグを防止
+                const profileData = {
+                    userId: userId,
+                    name: name || existing.name || '',
+                    avatarEnc: avatarEnc ? avatarEnc : (existing.avatarEnc || ''),
+                    avatarHash: avatarHash || existing.avatarHash || '',
+                    timestamp: timestamp,
+                    signature: signature || existing.signature || '',
+                    signatureV2: signatureV2 || (name || avatarEnc ? '' : (existing.signatureV2 || ''))
+                };
+
+                profileStore.set(userId, profileData);
+                enforceMapSizeCap(profileStore, 10000);
+                saveProfiles();
+                // ※相手への変更通知は行わず、一覧取得時等のサイレント差分同期のみ
+
                 res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ success: true, timestamp: lastBackupTime, rateLimited: true }));
+                res.end(JSON.stringify({ success: true, timestamp: timestamp }));
+                return true;
+            } catch (e) {
+                console.error('[Profile Update Error]', e);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'プロフィール更新中にエラーが発生しました' }));
                 return true;
             }
-            backupRateLimitMap.set(userId, nowTime);
-            if (backupRateLimitMap.size > 1000) {
-                const firstKey = backupRateLimitMap.keys().next().value;
-                backupRateLimitMap.delete(firstKey);
-            }
-
-            // VULN-72是正: 25MB超過の巨大ペイロードによるメモリ枯渇DoS攻撃を遮断
-            if (backupData.length > 25 * 1024 * 1024) {
-                console.warn(`[Security Block] バックアップデータサイズ上限(25MB)超過を遮断: ${userId}`);
-                res.writeHead(413, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'バックアップサイズが上限(25MB)を超えています' }));
-                return true;
-            }
-
-            // VULN-317是正: SERVER_DIR基準の安全なパス解決 (親ディレクトリ脱出を完全防止)
-            const backupDir = path.join(SERVER_DIR, 'backups');
-            if (!fs.existsSync(backupDir)) { fs.mkdirSync(backupDir, { recursive: true }); }
-            const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '_');
-            const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
-
-            // VULN-58是正: ディレクトリトラバーサル境界検証
-            if (!targetFile.startsWith(backupDir + path.sep)) {
-                console.warn(`[Security Block] 不正なバックアップパス(パストラバーサル)を遮断: ${userId}`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
-                return true;
-            }
-
-            // VULN-72是正: イベントループブロッキング防止のため非同期fs.promises.writeFileを使用
-            await fs.promises.writeFile(targetFile, backupData, 'utf8');
-            if (isSupabaseServiceReady())
-            {
-                await supabaseServiceUpsert(`cp_srv_chat_${safeUserId}`, 'chat_backup_srv', backupData);
-            }
-            console.log(`[Chat Backup] 会話履歴バックアップ保存成功: ${userId} (サイズ: ${backupData.length} chars)`);
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, timestamp: Date.now() }));
-            return true;
         }
-        catch (err) {
-            console.error('[Chat Backup Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
-        }
-    }
 
-    // [API 9] テキスト会話履歴バックアップ取得(復元用): GET /api/chat/backup
-    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/chat/backup') {
-        try {
-            const userId = (parsedReqUrl.searchParams.get('userId') || '').trim();
-            const token = extractBearerToken(req) || (parsedReqUrl.searchParams.get('token') || '').trim();
+        // [API 11] プロフィール一括取得 (友達一覧のアバター・名前一括同期)
+        if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/batch') {
+            try {
+                const token = extractBearerToken(req);
+                const body = await parseJsonBody(req);
+                const requesterUid = typeof body.requesterUid === 'string' ? body.requesterUid.trim() : '';
+                const userIds = Array.isArray(body.userIds) ? body.userIds : [];
+                const hasValidKnownObj = body.knownHashes && typeof body.knownHashes === 'object' && !Array.isArray(body.knownHashes);
+                const knownHashes = hasValidKnownObj ? body.knownHashes : {};
 
-            if (!userId) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'userIdが指定されていません' }));
-                return true;
-            }
-
-            if (!token || !isValidSession(token, userId)) {
-                console.warn(`[Security Block] 未認証または不正トークンによるバックアップ取得要求を遮断: ${userId}`);
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
-                return true;
-            }
-
-            // VULN-317是正: SERVER_DIR基準の安全なパス解決
-            const backupDir = path.join(SERVER_DIR, 'backups');
-            const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '_');
-            const targetFile = path.resolve(backupDir, `backup_${safeUserId}.enc`);
-
-            // VULN-58是正: ディレクトリトラバーサル境界検証
-            if (!targetFile.startsWith(backupDir + path.sep)) {
-                console.warn(`[Security Block] 不正なバックアップ取得パスを遮断: ${userId}`);
-                res.writeHead(403, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '不正なパス指定です' }));
-                return true;
-            }
-
-            let backupData = null;
-            let timestamp = Date.now();
-            if (fs.existsSync(targetFile))
-            {
-                // VULN-72是正: 非同期fs.promises.readFileおよびstatによるイベントループ保護
-                backupData = await fs.promises.readFile(targetFile, 'utf8');
-                const stat = await fs.promises.stat(targetFile);
-                timestamp = stat.mtimeMs;
-            }
-            else if (isSupabaseServiceReady())
-            {
-                backupData = await supabaseServiceSelect(`cp_srv_chat_${safeUserId}`);
-                if (backupData)
-                {
-                    await fs.promises.mkdir(backupDir, { recursive: true });
-                    await fs.promises.writeFile(targetFile, backupData, 'utf8');
+                // SEC-04是正: 一括取得UID配列(100件)およびknownHashes(200キー)の上限・プロトタイプ汚染保護
+                if (userIds.length > 100 || Object.keys(knownHashes).length > 200) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '一括取得件数が上限を超えています' }));
+                    return true;
                 }
-            }
 
-            if (!backupData) {
-                res.writeHead(404, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'バックアップが存在しません' }));
-                return true;
-            }
+                if (!requesterUid || !token || !isValidSession(token, requesterUid)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
 
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({
-                success: true,
-                userId: userId,
-                timestamp: timestamp,
-                backupData: backupData
-            }));
-            return true;
-        }
-        catch (err) {
-            console.error('[Chat Restore Error]', err);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: err.message }));
-            return true;
-        }
-    }
-
-
-    // [API 10] プロフィール更新 (暗号化アバター・名前のサーバー安全保管)
-    if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/update') {
-        try {
-            const token = extractBearerToken(req);
-            const body = await parseJsonBody(req);
-            const userId = (body.userId || '').trim();
-            const name = (body.name || '').trim();
-            const avatarEnc = (body.avatarEnc || '').trim();
-            const avatarHash = (body.avatarHash || '').trim();
-            const timestamp = Number(body.timestamp) || Date.now();
-            const signature = (body.signature || '').trim();
-
-            if (!userId || !token || !isValidSession(token, userId)) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
-                return true;
-            }
-
-            if (!name && !avatarEnc && !avatarHash) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '更新データがありません' }));
-                return true;
-            }
-
-            // VULN-250是正: アバター暗号文サイズ上限(512KB)の厳格検査
-            if (avatarEnc && avatarEnc.length > 512 * 1024) {
-                res.writeHead(413, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'アバターデータサイズが上限(512KB)を超えています' }));
-                return true;
-            }
-
-            const existing = profileStore.get(userId) || {};
-            // VULN-322是正: 空文字指定による既存アバターのサイレント消去バグを防止
-            const profileData = {
-                userId: userId,
-                name: name || existing.name || '',
-                avatarEnc: avatarEnc ? avatarEnc : (existing.avatarEnc || ''),
-                avatarHash: avatarHash || existing.avatarHash || '',
-                timestamp: timestamp,
-                signature: signature || existing.signature || ''
-            };
-
-            profileStore.set(userId, profileData);
-            enforceMapSizeCap(profileStore, 10000);
-            saveProfiles();
-            // ※相手への変更通知は行わず、一覧取得時等のサイレント差分同期のみ
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, timestamp: timestamp }));
-            return true;
-        } catch (e) {
-            console.error('[Profile Update Error]', e);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-            return true;
-        }
-    }
-
-    // [API 11] プロフィール一括取得 (友達一覧のアバター・名前一括同期)
-    if (req.method === 'POST' && parsedReqUrl.pathname === '/api/profile/batch') {
-        try {
-            const token = extractBearerToken(req);
-            const body = await parseJsonBody(req);
-            const requesterUid = (body.requesterUid || '').trim();
-            const userIds = Array.isArray(body.userIds) ? body.userIds : [];
-            const knownHashes = (body.knownHashes && typeof body.knownHashes === 'object') ? body.knownHashes : {};
-
-            // VULN-250是正: 一括取得UID配列の最大件数を100件に制限 (OOM DoS防止)
-            if (userIds.length > 100) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '一括取得件数が上限(100件)を超えています' }));
-                return true;
-            }
-
-            if (!token || !isValidSession(token, requesterUid)) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
-                return true;
-            }
-
-            const result = {};
-            for (const uid of userIds) {
-                const cleanUid = (uid || '').trim();
-                if (!cleanUid) continue;
-                const prof = profileStore.get(cleanUid);
-                if (prof) {
-                    const clientHash = knownHashes[cleanUid] || '';
+                const result = {};
+                for (const uid of userIds) {
+                    if (typeof uid !== 'string') { continue; }
+                    const cleanUid = uid.trim();
+                    if (!isValidUidFormat(cleanUid)) { continue; }
+                    const prof = profileStore.get(cleanUid);
+                    if (!prof) { continue; }
+                    const rawClientHash = Object.hasOwn(knownHashes, cleanUid) ? knownHashes[cleanUid] : '';
+                    const clientHash = (typeof rawClientHash === 'string' && rawClientHash.length <= 128) ? rawClientHash : '';
                     const isUnchanged = !!(clientHash && prof.avatarHash && clientHash === prof.avatarHash);
-                    result[cleanUid] = {
-                        userId: prof.userId,
-                        name: prof.name,
-                        avatarEnc: isUnchanged ? null : prof.avatarEnc,
-                        avatarHash: prof.avatarHash,
-                        timestamp: prof.timestamp,
-                        signature: prof.signature,
-                        unchanged: isUnchanged
-                    };
+                    result[cleanUid] = toPublicProfilePayload(prof, isUnchanged);
                 }
-            }
 
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ success: true, profiles: result }));
-            return true;
-        } catch (e) {
-            console.error('[Profile Batch Error]', e);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-            return true;
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ success: true, profiles: result }));
+                return true;
+            } catch (e) {
+                console.error('[Profile Batch Error]', e);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'プロフィール一括取得中にエラーが発生しました' }));
+                return true;
+            }
         }
+
+        // [API 12] 単一プロフィール取得 (SEC-04是正: UID検証と最小公開フィールド限定)
+        if (req.method === 'GET' && parsedReqUrl.pathname === '/api/profile/get') {
+            try {
+                const token = extractBearerToken(req);
+                const targetUid = (parsedReqUrl.searchParams.get('userId') || '').trim();
+                let session = activeSessions.get(token);
+                if (!session && token && token.startsWith('st1.')) {
+                    session = verifyAndRestoreStatelessToken(token);
+                }
+                const requesterUid = (session?.deviceUid || '').trim();
+
+                if (!token || !requesterUid || !isValidSession(token, requesterUid)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
+                    return true;
+                }
+                if (!isValidUidFormat(targetUid)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: '無効なユーザーID指定です' }));
+                    return true;
+                }
+
+                const prof = profileStore.get(targetUid);
+                if (!prof) {
+                    res.writeHead(404, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'プロフィールが見つかりません' }));
+                    return true;
+                }
+
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({
+                    success: true,
+                    profile: toPublicProfilePayload(prof)
+                }));
+                return true;
+            } catch (e) {
+                console.error('[Profile Get Error]', e);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'プロフィール取得中にエラーが発生しました' }));
+                return true;
+            }
+        }
+
+        return false;
     }
 
-    // [API 12] 単一プロフィール取得
-    if (req.method === 'GET' && parsedReqUrl.pathname === '/api/profile/get') {
+    // アップロードファイルの定期クリーンアップ (24時間超過した一時暗号化ファイルを自動消去)
+    setInterval(() => {
         try {
-            const token = extractBearerToken(req);
-            const targetUid = (parsedReqUrl.searchParams.get('userId') || '').trim();
-            let session = activeSessions.get(token);
-            if (!session && token && token.startsWith('st1.')) {
-                session = verifyAndRestoreStatelessToken(token);
-            }
-            const requesterUid = (session?.deviceUid || '').trim();
-
-            if (!token || !isValidSession(token, requesterUid) || !requesterUid || !targetUid) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: '認証セッションが無効です' }));
-                return true;
-            }
-
-            const prof = profileStore.get(targetUid);
-            if (!prof) {
-                res.writeHead(404, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'プロフィールが見つかりません' }));
-                return true;
-            }
-
-            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({
-                success: true,
-                profile: prof
-            }));
-            return true;
-        } catch (e) {
-            console.error('[Profile Get Error]', e);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: e.message }));
-            return true;
-        }
-    }
-
-    return false;
-}
-
-// アップロードファイルの定期クリーンアップ (24時間超過した一時暗号化ファイルを自動消去)
-setInterval(() => {
-    try {
-        if (fs.existsSync(UPLOAD_DIR)) {
-            const now = Date.now();
-            const TTL_MS = 24 * 60 * 60 * 1000;
-            const files = fs.readdirSync(UPLOAD_DIR);
-            let aclChanged = false;
-            for (const f of files) {
-                try {
-                    if (f.startsWith('enc_') && f.endsWith('.bin')) {
-                        const fp = path.join(UPLOAD_DIR, f);
-                        const stat = fs.statSync(fp);
-                        if (now - stat.mtimeMs > TTL_MS) {
-                            fs.unlinkSync(fp);
-                            attachmentAclStore.delete(f.slice(0, -4));
-                            aclChanged = true;
-                            console.log(`[File Cleanup] 期限切れ一時暗号化ファイルを自動消去: ${f}`);
+            if (fs.existsSync(UPLOAD_DIR)) {
+                const now = Date.now();
+                const TTL_MS = 24 * 60 * 60 * 1000;
+                const files = fs.readdirSync(UPLOAD_DIR);
+                let aclChanged = false;
+                for (const f of files) {
+                    try {
+                        if (f.startsWith('enc_') && f.endsWith('.bin')) {
+                            const fp = path.join(UPLOAD_DIR, f);
+                            const stat = fs.statSync(fp);
+                            if (now - stat.mtimeMs > TTL_MS) {
+                                fs.unlinkSync(fp);
+                                attachmentAclStore.delete(f.slice(0, -4));
+                                aclChanged = true;
+                                console.log(`[File Cleanup] 期限切れ一時暗号化ファイルを自動消去: ${f}`);
+                            }
                         }
+                    } catch (fileErr) {
+                        console.error(`[File Cleanup Error] ${f} の消去に失敗:`, fileErr.message);
                     }
-                } catch (fileErr) {
-                    console.error(`[File Cleanup Error] ${f} の消去に失敗:`, fileErr.message);
+                }
+                if (aclChanged) {
+                    saveAttachmentAcls();
                 }
             }
-            if (aclChanged) {
-                saveAttachmentAcls();
-            }
         }
-    }
-    catch (e) {
-        console.error('[File Cleanup Error]', e.message);
-    }
-}, 3600000);
+        catch (e) {
+            console.error('[File Cleanup Error]', e.message);
+        }
+    }, 3600000);
 
-module.exports = {
-    handleChatAndFileRoutes
-};
+    module.exports = {
+        handleChatAndFileRoutes
+    };
 
-return module.exports;
+    return module.exports;
 })({ exports: {} }, {});
 
 // ==================== [Module: ./modules/wsSignaling.js] ====================
-__internalModules['./modules/wsSignaling'] = (function(module, exports) {
-// 変更日時：2026年11月06日 14時35分
-// [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
+__internalModules['./modules/wsSignaling'] = (function (module, exports) {
+    // 変更日時：2026年11月16日 12時47分
+    // [サーバーモジュール] WebSocket P2P通話シグナリング ＆ E2EEチャット・既読リアルタイム中継
 
-const WebSocket = require('ws');
-const {
-    fcmTokenStore,
-    seenInviteNonces,
-    offlineMessageQueue,
-    offlineReadQueue,
-    recentChatPacketIds,
-    rooms,
-    users,
-    wsIpConnectionCount,
-    enforceMapSizeCap,
-    isValidSession,
-    saveOfflineQueue,
-    saveOfflineReads
-} = __requireModule('./modules/stateStore');
-const { sendIncomingCallPush, sendChatMessagePush } = __requireModule('./modules/pushAndMail');
+    const WebSocket = require('ws');
+    const {
+        fcmTokenStore,
+        seenInviteNonces,
+        offlineMessageQueue,
+        recentChatPacketIds,
+        rooms,
+        users,
+        wsIpConnectionCount,
+        enforceMapSizeCap,
+        extractTokenJti,
+        isTokenRevoked,
+        isValidSession,
+        saveOfflineQueue,
+        enqueueOfflineRead,
+        isChatSendRateLimited
+    } = __requireModule('./modules/stateStore');
+    const { sendIncomingCallPush, sendChatMessagePush } = __requireModule('./modules/pushAndMail');
 
-// ルームからの退出処理
-function removeClientFromRoom(ws, roomId, userId) {
-    if (!roomId || !rooms.has(roomId)) { return; }
-    const room = rooms.get(roomId);
-    let target = null;
-    room.forEach((client) => {
-        if (client.ws === ws) { target = client; }
-    });
-
-    if (target) {
-        room.delete(target);
-        console.log(`[Leave] Room: ${roomId}, User: ${userId}, Remaining: ${room.size}`);
-        room.forEach((client) => {
-            if (client.ws.readyState === WebSocket.OPEN) {
-                client.ws.send(JSON.stringify({ type: 'left', peerId: userId }));
-            }
-        });
+    // 認証済みWebSocketのトークン有効・非失効検証 (SEC-05)
+    function isWsSessionStillValid(ws, expectedUid) {
+        if (!ws || !ws.sessionToken) { return true; }
+        if (isTokenRevoked(ws.sessionToken, ws.sessionJti || '')) { return false; }
+        if (!expectedUid) { return false; }
+        return isValidSession(ws.sessionToken, expectedUid, false);
     }
 
-    if (room.size === 0) {
-        rooms.delete(roomId);
-    }
-}
-
-// WebSocketサーバーの初期化と全イベントバインド
-function setupWebSocketServer(server) {
-    const wss = new WebSocket.Server({ server, maxPayload: 512 * 1024 });
-
-    // 25秒間隔のハートビートPing
-    const heartbeatInterval = setInterval(() => {
-        wss.clients.forEach((ws) => {
-            if (ws.isAlive === false) {
-                return ws.terminate();
-            }
-            ws.isAlive = false;
-            ws.ping();
-        });
-    }, 25000);
-
-    wss.on('close', () => {
-        clearInterval(heartbeatInterval);
-    });
-
-    wss.on('connection', (ws, req) => {
-        // VULN-37 & VULN-76是正: 偽装X-Forwarded-For対策 ＆ CGNAT同一IPでの同時接続上限を100に拡大 (モバイル回線ユーザー締め出し完全防止)
-        const rawForwarded = req?.headers?.['x-forwarded-for'];
-        const forwardedIps = rawForwarded ? rawForwarded.split(',').map(s => s.trim()).filter(Boolean) : [];
-        const wsClientIp = (forwardedIps.length > 0 ? forwardedIps[forwardedIps.length - 1] : null) || req?.socket?.remoteAddress || 'unknown';
-        const currentIpConns = wsIpConnectionCount.get(wsClientIp) || 0;
-        if (currentIpConns >= 100) {
-            console.warn(`[WS DoS Block] 同一IPからの同時接続上限(100)超過を遮断: ${wsClientIp}`);
-            ws.close(1008, 'Too many connections from this IP');
-            return;
+    // 失効・期限切れWebSocketへの通知と即時切断
+    function disconnectUnauthorizedWs(ws, reason) {
+        if (!ws) { return; }
+        if (ws.readyState === WebSocket.OPEN) {
+            try { ws.send(JSON.stringify({ type: 'auth_error', message: '認証セッションが失効しました。再ログインしてください' })); } catch (e) { }
         }
-        wsIpConnectionCount.set(wsClientIp, currentIpConns + 1);
+        try { ws.close(4001, reason || 'Unauthorized'); } catch (e) { }
+    }
 
-        ws.isAlive = true;
-        ws.on('pong', () => { ws.isAlive = true; });
+    // ルームからの退出処理
+    function removeClientFromRoom(ws, roomId, userId) {
+        if (!roomId || !rooms.has(roomId)) { return; }
+        const room = rooms.get(roomId);
+        let target = null;
+        room.forEach((client) => {
+            if (client.ws === ws) { target = client; }
+        });
 
-        let currentRoomId = null;
-        let currentUserId = null;
+        if (target) {
+            room.delete(target);
+            console.log(`[Leave] Room: ${roomId}, User: ${userId}, Remaining: ${room.size}`);
+            room.forEach((client) => {
+                if (client.ws.readyState === WebSocket.OPEN) {
+                    client.ws.send(JSON.stringify({ type: 'left', peerId: userId }));
+                }
+            });
+        }
 
-        const unauthTimeout = setTimeout(() => {
-            if (!currentUserId && ws.readyState === WebSocket.OPEN) {
-                console.warn(`[WS Unauth Timeout] 15秒間未認証のソケットを強制切断: ${wsClientIp}`);
-                ws.close(4001, 'Authentication timeout');
+        if (room.size === 0) {
+            rooms.delete(roomId);
+        }
+    }
+
+    // WebSocketサーバーの初期化と全イベントバインド
+    function setupWebSocketServer(server) {
+        const wss = new WebSocket.Server({ server, maxPayload: 512 * 1024 });
+
+        // 25秒間隔のハートビートPing (SEC-05: 失効・絶対期限超過セッションの即時遮断を併施)
+        const heartbeatInterval = setInterval(() => {
+            wss.clients.forEach((ws) => {
+                if (ws.sessionToken && !isWsSessionStillValid(ws, ws.userId)) {
+                    disconnectUnauthorizedWs(ws, 'Session revoked or expired');
+                    return;
+                }
+                if (ws.isAlive === false) {
+                    return ws.terminate();
+                }
+                ws.isAlive = false;
+                ws.ping();
+            });
+        }, 25000);
+
+        wss.on('close', () => {
+            clearInterval(heartbeatInterval);
+        });
+
+        wss.on('connection', (ws, req) => {
+            // VULN-37 & VULN-76是正: 偽装X-Forwarded-For対策 ＆ CGNAT同一IPでの同時接続上限を100に拡大 (モバイル回線ユーザー締め出し完全防止)
+            const rawForwarded = req?.headers?.['x-forwarded-for'];
+            const forwardedIps = rawForwarded ? rawForwarded.split(',').map(s => s.trim()).filter(Boolean) : [];
+            const wsClientIp = (forwardedIps.length > 0 ? forwardedIps[forwardedIps.length - 1] : null) || req?.socket?.remoteAddress || 'unknown';
+            const currentIpConns = wsIpConnectionCount.get(wsClientIp) || 0;
+            if (currentIpConns >= 100) {
+                console.warn(`[WS DoS Block] 同一IPからの同時接続上限(100)超過を遮断: ${wsClientIp}`);
+                ws.close(1008, 'Too many connections from this IP');
+                return;
             }
-        }, 15000);
+            wsIpConnectionCount.set(wsClientIp, currentIpConns + 1);
 
-        ws.rateLimitWindowStart = Date.now();
-        ws.messageCountInWindow = 0;
+            ws.isAlive = true;
+            ws.on('pong', () => { ws.isAlive = true; });
 
-        ws.on('message', (message) => {
-            try {
-                // VULN-48是正: 巨大パケットの同期JSONパースによるイベントループブロッキングDoSを遮断
-                if (message.length > 512 * 1024) {
-                    console.warn(`[Security Block] 許容サイズ(512KB)超過のWebSocketパケットを遮断: size=${message.length}`);
-                    ws.close(1009, 'Message too big');
-                    return;
+            let currentRoomId = null;
+            let currentUserId = null;
+
+            const unauthTimeout = setTimeout(() => {
+                if (!currentUserId && ws.readyState === WebSocket.OPEN) {
+                    console.warn(`[WS Unauth Timeout] 15秒間未認証のソケットを強制切断: ${wsClientIp}`);
+                    ws.close(4001, 'Authentication timeout');
                 }
+            }, 15000);
 
-                const now = Date.now();
-                if (now - ws.rateLimitWindowStart > 1000) {
-                    ws.rateLimitWindowStart = now;
-                    ws.messageCountInWindow = 0;
-                }
-                ws.messageCountInWindow++;
-                if (ws.messageCountInWindow > 30) {
-                    console.warn(`[Rate Limit Exceeded] メッセージ過剰送信をドロップ: ${currentUserId || 'unknown'}`);
-                    return;
-                }
+            ws.rateLimitWindowStart = Date.now();
+            ws.messageCountInWindow = 0;
 
-                const data = JSON.parse(message);
-                const type = data.type;
-                const roomId = data.roomId;
-                const userId = data.userId;
-                const token = data.token;
-
-                // 1. 待受登録
-                if (type === 'register') {
-                    if (!isValidSession(token, userId)) {
-                        console.warn(`[Security Block] 不正または未認証セッションによる待受登録を拒否: ${userId}`);
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: 'auth_error', message: '認証セッションが無効です。再ログインしてください' }));
-                        }
-                        ws.close(4001, 'Unauthorized');
+            ws.on('message', (message) => {
+                try {
+                    // VULN-48是正: 巨大パケットの同期JSONパースによるイベントループブロッキングDoSを遮断
+                    if (message.length > 512 * 1024) {
+                        console.warn(`[Security Block] 許容サイズ(512KB)超過のWebSocketパケットを遮断: size=${message.length}`);
+                        ws.close(1009, 'Message too big');
                         return;
                     }
 
-                    currentUserId = userId;
-                    ws.userId = userId;
-                    users.set(userId, { ws, name: data.name || '友だち', token: token });
-                    console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
-                    ws.send(JSON.stringify({ type: 'registered', userId: userId }));
-
-                    if (offlineMessageQueue.has(userId)) {
-                        const queuedMessages = offlineMessageQueue.get(userId) || [];
-                        if (queuedMessages.length > 0 && ws.readyState === WebSocket.OPEN) {
-                            console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を一括バッチ配信`);
-                            ws.send(JSON.stringify({
-                                type: 'chat_messages_batch',
-                                targetUserId: userId,
-                                messages: queuedMessages
-                            }));
-                        }
-                        offlineMessageQueue.delete(userId);
-                        saveOfflineQueue();
+                    const now = Date.now();
+                    if (now - ws.rateLimitWindowStart > 1000) {
+                        ws.rateLimitWindowStart = now;
+                        ws.messageCountInWindow = 0;
+                    }
+                    ws.messageCountInWindow++;
+                    if (ws.messageCountInWindow > 30) {
+                        console.warn(`[Rate Limit Exceeded] メッセージ過剰送信をドロップ: ${currentUserId || 'unknown'}`);
+                        return;
                     }
 
-                    if (offlineReadQueue.has(userId)) {
-                        const queuedReads = offlineReadQueue.get(userId) || [];
-                        if (queuedReads.length > 0 && ws.readyState === WebSocket.OPEN) {
-                            console.log(`[Offline Read Queue] 待受復帰した ${userId} へ保留既読通知 ${queuedReads.length}件を一括配信`);
-                            for (const r of queuedReads) {
+                    const data = JSON.parse(message);
+                    const type = data.type;
+                    const roomId = data.roomId;
+                    const userId = data.userId;
+                    const token = data.token;
+
+                    // SEC-05: 登録済みWebSocketの後続パケット受信前にトークン失効・期限を再検証
+                    if (type !== 'register' && type !== 'join' && ws.sessionToken && !isWsSessionStillValid(ws, currentUserId || ws.userId)) {
+                        console.warn(`[Security Block] 失効または期限切れWebSocketからの通信を遮断: uid=${currentUserId || ws.userId || 'unknown'}`);
+                        disconnectUnauthorizedWs(ws, 'Session revoked or expired');
+                        return;
+                    }
+
+                    // 1. 待受登録
+                    if (type === 'register') {
+                        if (!isValidSession(token, userId)) {
+                            console.warn(`[Security Block] 不正または未認証セッションによる待受登録を拒否: ${userId}`);
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'auth_error', message: '認証セッションが無効です。再ログインしてください' }));
+                            }
+                            ws.close(4001, 'Unauthorized');
+                            return;
+                        }
+
+                        currentUserId = userId;
+                        ws.userId = userId;
+                        ws.sessionToken = token;
+                        ws.sessionJti = extractTokenJti(token);
+                        users.set(userId, { ws, name: data.name || '友だち', token: token });
+                        console.log(`[Register] User standby: ${userId} (${data.name || ''})`);
+                        ws.send(JSON.stringify({ type: 'registered', userId: userId }));
+
+                        if (offlineMessageQueue.has(userId)) {
+                            const queuedMessages = offlineMessageQueue.get(userId) || [];
+                            if (queuedMessages.length > 0 && ws.readyState === WebSocket.OPEN) {
+                                console.log(`[Offline Queue] 待受復帰した ${userId} へ保留メッセージ ${queuedMessages.length}件を一括バッチ配信`);
                                 ws.send(JSON.stringify({
-                                    type: 'chat_read',
-                                    fromUserId: r.fromUserId,
-                                    targetUserId: r.targetUserId,
-                                    messageIds: r.messageIds
+                                    type: 'chat_messages_batch',
+                                    targetUserId: userId,
+                                    messages: queuedMessages
+                                }));
+                            }
+                            offlineMessageQueue.delete(userId);
+                            saveOfflineQueue();
+                        }
+
+                        if (offlineReadQueue.has(userId)) {
+                            const queuedReads = offlineReadQueue.get(userId) || [];
+                            if (queuedReads.length > 0 && ws.readyState === WebSocket.OPEN) {
+                                console.log(`[Offline Read Queue] 待受復帰した ${userId} へ保留既読通知 ${queuedReads.length}件を一括配信`);
+                                for (const r of queuedReads) {
+                                    ws.send(JSON.stringify({
+                                        type: 'chat_read',
+                                        fromUserId: r.fromUserId,
+                                        targetUserId: r.targetUserId,
+                                        messageIds: r.messageIds
+                                    }));
+                                }
+                            }
+                            offlineReadQueue.delete(userId);
+                            saveOfflineReads();
+                        }
+                        return;
+                    }
+
+                    // 2. 着信コール通知
+                    if (type === 'call_invite') {
+                        const targetUserId = data.targetUserId || data.targetId;
+                        const fromUserId = data.fromUserId;
+                        const timestamp = Number(data.timestamp) || 0;
+                        const nonce = (data.nonce || '').trim();
+
+                        const callerUid = ws.userId || currentUserId;
+                        if (!callerUid || (fromUserId && callerUid !== fromUserId)) {
+                            console.warn(`[Call Invite Rejected] 未認証またはUID不一致の着信要求: callerUid=${callerUid}, fromUserId=${fromUserId}`);
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ type: 'auth_error', message: '未認証の接続から着信を発信することはできません' }));
+                            }
+                            return;
+                        }
+
+                        if (timestamp <= 0 || !nonce || nonce.length < 8 || nonce.length > 128) {
+                            console.warn(`[Call Invite Rejected] timestampまたはnonce未指定の不正パケットを遮断 from ${fromUserId}`);
+                            return;
+                        }
+                        const diff = Math.abs(now - timestamp);
+                        if (diff > 35000) {
+                            console.warn(`[Call Invite Rejected] タイムスタンプ期限切れ (diff=${diff}ms) from ${fromUserId}`);
+                            return;
+                        }
+
+                        if (seenInviteNonces.has(nonce)) {
+                            console.warn(`[Call Invite Rejected] Nonce重複リプレイ攻撃検知: nonce=${nonce} from ${fromUserId}`);
+                            return;
+                        }
+                        if (seenInviteNonces.size >= 10000) {
+                            const firstItem = seenInviteNonces.values().next().value;
+                            seenInviteNonces.delete(firstItem);
+                        }
+                        seenInviteNonces.add(nonce);
+                        setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
+
+                        const targetEntry = users.get(targetUserId);
+                        let forwardedViaWs = false;
+
+                        // VULN-86是正: 通話roomIdの厳格検証 (callerUid・targetUserIdの正規性照合 ＆ 第三者UID混入遮断)
+                        const roomStr = typeof data.roomId === 'string' ? data.roomId.trim() : '';
+                        const inviteUids = roomStr ? (roomStr.match(/(?:u_[a-zA-Z0-9]+|bot_[a-zA-Z0-9_]+)/g) || []) : [];
+                        const hasCaller = inviteUids.includes(callerUid);
+                        const hasTarget = !targetUserId || inviteUids.includes(targetUserId);
+                        if (!roomStr || inviteUids.length === 0 || !hasCaller || !hasTarget) {
+                            console.warn(`[Call Invite Rejected] 不正なroomId指定を遮断: caller=${callerUid}, target=${targetUserId}, room=${data.roomId}`);
+                            return;
+                        }
+                        // VULN-55是正: 送信者表示名の偽装(Caller ID Spoofing)を防止。サーバー登録認証名を優先バインド
+                        const verifiedSenderName = users.get(callerUid)?.name || data.fromName || '友だち';
+                        if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                            targetEntry.ws.send(JSON.stringify({
+                                type: 'incoming_call',
+                                fromUserId: data.fromUserId,
+                                fromName: verifiedSenderName,
+                                roomId: data.roomId,
+                                isVideo: data.isVideo === true || data.isVideo === 'true',
+                                timestamp: timestamp || Date.now(),
+                                nonce: nonce
+                            }));
+                            console.log(`[Call Invite] Forwarded via WebSocket from ${data.fromUserId} to ${targetUserId} (name=${verifiedSenderName})`);
+                            forwardedViaWs = true;
+                        }
+
+                        const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
+                        if (targetFcm && targetFcm.fcmToken) {
+                            console.log(`[Call Invite] Triggering FCM Push to target: ${targetUserId} (wsOnline=${forwardedViaWs})`);
+                            sendIncomingCallPush(targetFcm.fcmToken, {
+                                fromUserId: callerUid,
+                                fromName: verifiedSenderName,
+                                roomId: data.roomId,
+                                isVideo: data.isVideo === true || data.isVideo === 'true',
+                                timestamp: timestamp || Date.now(),
+                                nonce: nonce
+                            });
+                        }
+                        else if (!forwardedViaWs) {
+                            console.warn(`[Call Invite Offline] 相手(${targetUserId})はWebSocket切断かつFCMトークン未登録`);
+                            ws.send(JSON.stringify({ type: 'call_user_offline', targetUserId: targetUserId }));
+                        }
+                        return;
+                    }
+
+                    // 3. 着信拒否・キャンセル (SEC-05: 許可フィールドのみ再構築して転送)
+                    if (type === 'call_cancel' || type === 'call_decline') {
+                        const callerUid = ws.userId || currentUserId;
+                        if (!callerUid || !data.fromUserId || callerUid !== data.fromUserId) {
+                            console.warn(`[Call Cancel Block] 未認証または送信元UID不一致の切断要求を破棄: auth=${callerUid}, packet=${data.fromUserId}`);
+                            return;
+                        }
+                        const targetUserId = typeof (data.targetUserId || data.targetId) === 'string'
+                            ? (data.targetUserId || data.targetId).trim()
+                            : '';
+                        if (!targetUserId) { return; }
+                        const safeCancelPacket = {
+                            type: type,
+                            fromUserId: callerUid,
+                            targetUserId: targetUserId
+                        };
+                        if (typeof data.roomId === 'string' && data.roomId.trim()) {
+                            safeCancelPacket.roomId = data.roomId.trim().slice(0, 128);
+                        }
+                        const targetEntry = users.get(targetUserId);
+                        if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                            targetEntry.ws.send(JSON.stringify(safeCancelPacket));
+                        }
+                        return;
+                    }
+
+                    // 4. チャットメッセージ ＆ ECDH鍵交換パケット中継
+                    if (['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(type)) {
+                        if (!currentUserId || !data.fromUserId || data.fromUserId !== currentUserId) {
+                            console.warn(`[Security Block] 未認証またはチャット送信元UID偽装を遮断: registered=${currentUserId}, packet=${data.fromUserId}`);
+                            return;
+                        }
+                        if (type === 'chat_message' && isChatSendRateLimited(currentUserId)) {
+                            console.warn(`[Rate Limit Exceeded] WSチャット送信レート超過を遮断: ${currentUserId}`);
+                            return;
+                        }
+
+                        if (message.length > 512 * 1024) {
+                            console.warn(`[Security Block] 許容サイズ(512KB)超過の巨大メッセージを破棄: ${data.fromUserId}`);
+                            return;
+                        }
+
+                        const targetUserId = data.targetUserId || data.targetId;
+                        const targetEntry = users.get(targetUserId);
+                        const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
+                        const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
+                        const dedupKey = data.messageId ? `${data.fromUserId}:${targetUserId}:${data.messageId}` : '';
+                        const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
+                        if (dedupKey) {
+                            enforceMapSizeCap(recentChatPacketIds, 5000);
+                            recentChatPacketIds.set(dedupKey, Date.now());
+                        }
+
+                        let sentViaWs = false;
+                        if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                            if (!alreadyProcessed) {
+                                targetEntry.ws.send(JSON.stringify(data));
+                                console.log(`[E2EE Chat] Forwarded encrypted message from ${data.fromUserId} to ${targetUserId} (subType=${data.subType || 'normal'})`);
+                            }
+                            sentViaWs = true;
+                        }
+
+                        // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
+                        if (!sentViaWs || isMutation) {
+                            if (!offlineMessageQueue.has(targetUserId)) {
+                                enforceMapSizeCap(offlineMessageQueue, 500);
+                                offlineMessageQueue.set(targetUserId, []);
+                            }
+                            const queue = offlineMessageQueue.get(targetUserId);
+                            if (data.subType === 'unsend' && data.targetMessageId) {
+                                for (let i = queue.length - 1; i >= 0; i--) {
+                                    if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === data.fromUserId) {
+                                        queue.splice(i, 1);
+                                    }
+                                }
+                            }
+                            else if (data.subType === 'edit' && data.targetMessageId) {
+                                for (let i = queue.length - 1; i >= 0; i--) {
+                                    if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === data.fromUserId) {
+                                        queue.splice(i, 1);
+                                    }
+                                }
+                            }
+                            if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
+                                if (queue.length >= 100) {
+                                    console.warn(`[E2EE Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
+                                } else {
+                                    queue.push(data);
+                                    saveOfflineQueue();
+                                    console.log(`[E2EE Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
+                                }
+                            }
+                        }
+
+                        if (type === 'chat_message' && !alreadyProcessed) {
+                            const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
+                            if (targetFcm && targetFcm.fcmToken) {
+                                sendChatMessagePush(targetFcm.fcmToken, {
+                                    subType: data.subType || '',
+                                    targetMessageId: data.targetMessageId || '',
+                                    fromUserId: (currentUserId || data.fromUserId),
+                                    fromName: senderName,
+                                    messageId: data.messageId,
+                                    text: data.text || '',
+                                    iv: data.iv || '',
+                                    cipher: data.cipher || '',
+                                    // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
+                                    hasImage: data.imageBase64 ? 'true' : '',
+                                    fileUrl: data.fileUrl || '',
+                                    fileKey: '',
+                                    fileName: data.fileName || '',
+                                    fileSize: data.fileSize || '0',
+                                    senderPubKey: data.senderPubKey || '',
+                                    senderPubSig: data.senderPubSig || '',
+                                    timestamp: data.timestamp || Date.now()
+                                });
+                            }
+
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: 'chat_sent_ack',
+                                    messageId: data.messageId,
+                                    timestamp: Date.now()
                                 }));
                             }
                         }
-                        offlineReadQueue.delete(userId);
-                        saveOfflineReads();
+                        return;
                     }
-                    return;
-                }
 
-                // 2. 着信コール通知
-                if (type === 'call_invite') {
-                    const targetUserId = data.targetUserId || data.targetId;
-                    const fromUserId = data.fromUserId;
-                    const timestamp = Number(data.timestamp) || 0;
-                    const nonce = (data.nonce || '').trim();
-
-                    const callerUid = ws.userId || currentUserId;
-                    if (!callerUid || (fromUserId && callerUid !== fromUserId)) {
-                        console.warn(`[Call Invite Rejected] 未認証またはUID不一致の着信要求: callerUid=${callerUid}, fromUserId=${fromUserId}`);
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ type: 'auth_error', message: '未認証の接続から着信を発信することはできません' }));
+                    // 4.9. 暗号鍵不一致(復号失敗)エラー通知中継 (VULN-121是正: 認証済みUID強制上書き)
+                    if (type === 'chat_decrypt_error') {
+                        const regUid = (currentUserId || '').trim();
+                        if (!regUid) {
+                            console.warn('[Security Block] 未登録ソケットからのchat_decrypt_errorを遮断');
+                            return;
                         }
-                        return;
-                    }
+                        const targetUserId = (data.targetUserId || data.targetId || '').trim();
+                        const messageId = (data.messageId || '').trim();
+                        if (!targetUserId || !messageId) { return; }
 
-                    if (timestamp <= 0 || !nonce || nonce.length < 8 || nonce.length > 128) {
-                        console.warn(`[Call Invite Rejected] timestampまたはnonce未指定の不正パケットを遮断 from ${fromUserId}`);
-                        return;
-                    }
-                    const diff = Math.abs(now - timestamp);
-                    if (diff > 35000) {
-                        console.warn(`[Call Invite Rejected] タイムスタンプ期限切れ (diff=${diff}ms) from ${fromUserId}`);
-                        return;
-                    }
-
-                    if (seenInviteNonces.has(nonce)) {
-                        console.warn(`[Call Invite Rejected] Nonce重複リプレイ攻撃検知: nonce=${nonce} from ${fromUserId}`);
-                        return;
-                    }
-                    if (seenInviteNonces.size >= 10000) {
-                        const firstItem = seenInviteNonces.values().next().value;
-                        seenInviteNonces.delete(firstItem);
-                    }
-                    seenInviteNonces.add(nonce);
-                    setTimeout(() => { seenInviteNonces.delete(nonce); }, 60000);
-
-                    const targetEntry = users.get(targetUserId);
-                    let forwardedViaWs = false;
-
-                    // VULN-86是正: 通話roomIdの厳格検証 (callerUid・targetUserIdの正規性照合 ＆ 第三者UID混入遮断)
-                    const roomStr = typeof data.roomId === 'string' ? data.roomId.trim() : '';
-                    const inviteUids = roomStr ? (roomStr.match(/(?:u_[a-zA-Z0-9]+|bot_[a-zA-Z0-9_]+)/g) || []) : [];
-                    const hasCaller = inviteUids.includes(callerUid);
-                    const hasTarget = !targetUserId || inviteUids.includes(targetUserId);
-                    if (!roomStr || inviteUids.length === 0 || !hasCaller || !hasTarget) {
-                        console.warn(`[Call Invite Rejected] 不正なroomId指定を遮断: caller=${callerUid}, target=${targetUserId}, room=${data.roomId}`);
-                        return;
-                    }
-                    // VULN-55是正: 送信者表示名の偽装(Caller ID Spoofing)を防止。サーバー登録認証名を優先バインド
-                    const verifiedSenderName = users.get(callerUid)?.name || data.fromName || '友だち';
-                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                        targetEntry.ws.send(JSON.stringify({
-                            type: 'incoming_call',
-                            fromUserId: data.fromUserId,
-                            fromName: verifiedSenderName,
-                            roomId: data.roomId,
-                            isVideo: data.isVideo === true || data.isVideo === 'true',
-                            timestamp: timestamp || Date.now(),
-                            nonce: nonce
-                        }));
-                        console.log(`[Call Invite] Forwarded via WebSocket from ${data.fromUserId} to ${targetUserId} (name=${verifiedSenderName})`);
-                        forwardedViaWs = true;
-                    }
-
-                    const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
-                    if (targetFcm && targetFcm.fcmToken) {
-                        console.log(`[Call Invite] Triggering FCM Push to target: ${targetUserId} (wsOnline=${forwardedViaWs})`);
-                        sendIncomingCallPush(targetFcm.fcmToken, {
-                            fromUserId: callerUid,
-                            fromName: verifiedSenderName,
-                            roomId: data.roomId,
-                            isVideo: data.isVideo === true || data.isVideo === 'true',
-                            timestamp: timestamp || Date.now(),
-                            nonce: nonce
-                        });
-                    }
-                    else if (!forwardedViaWs) {
-                        console.warn(`[Call Invite Offline] 相手(${targetUserId})はWebSocket切断かつFCMトークン未登録`);
-                        ws.send(JSON.stringify({ type: 'call_user_offline', targetUserId: targetUserId }));
-                    }
-                    return;
-                }
-
-                // 3. 着信拒否・キャンセル
-                if (type === 'call_cancel' || type === 'call_decline') {
-                    const callerUid = ws.userId || currentUserId;
-                    if (!callerUid || !data.fromUserId || callerUid !== data.fromUserId) {
-                        console.warn(`[Call Cancel Block] 未認証または送信元UID不一致の切断要求を破棄: auth=${callerUid}, packet=${data.fromUserId}`);
-                        return;
-                    }
-                    const targetUserId = data.targetUserId || data.targetId;
-                    const targetEntry = users.get(targetUserId);
-                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                        targetEntry.ws.send(JSON.stringify(data));
-                    }
-                    return;
-                }
-
-                // 4. チャットメッセージ ＆ ECDH鍵交換パケット中継
-                if (['chat_message', 'chat_key_ping', 'chat_key_pong'].includes(type)) {
-                    if (!currentUserId || !data.fromUserId || data.fromUserId !== currentUserId) {
-                        console.warn(`[Security Block] 未認証またはチャット送信元UID偽装を遮断: registered=${currentUserId}, packet=${data.fromUserId}`);
-                        return;
-                    }
-
-                    if (message.length > 512 * 1024) {
-                        console.warn(`[Security Block] 許容サイズ(35MB)超過の巨大メッセージを破棄: ${data.fromUserId}`);
-                        return;
-                    }
-
-                    const targetUserId = data.targetUserId || data.targetId;
-                    const targetEntry = users.get(targetUserId);
-                    const senderName = users.get(data.fromUserId)?.name || data.fromName || '友だち';
-                    const isMutation = (data.subType === 'unsend' || data.subType === 'edit');
-                    const dedupKey = data.messageId ? `${data.fromUserId}:${targetUserId}:${data.messageId}` : '';
-                    const alreadyProcessed = dedupKey ? recentChatPacketIds.has(dedupKey) : false;
-                    if (dedupKey) {
-                        enforceMapSizeCap(recentChatPacketIds, 5000);
-                        recentChatPacketIds.set(dedupKey, Date.now());
-                    }
-
-                    let sentViaWs = false;
-                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                        if (!alreadyProcessed) {
-                            targetEntry.ws.send(JSON.stringify(data));
-                            console.log(`[E2EE Chat] Forwarded encrypted message from ${data.fromUserId} to ${targetUserId} (subType=${data.subType || 'normal'})`);
-                        }
-                        sentViaWs = true;
-                    }
-
-                    // オフライン時、または送信取消・書換え(unsend/edit)時はハーフオープン対策として必ずキュー側にも反映 (No.17対策)
-                    if (!sentViaWs || isMutation) {
-                        if (!offlineMessageQueue.has(targetUserId)) {
-                            enforceMapSizeCap(offlineMessageQueue, 500);
-                            offlineMessageQueue.set(targetUserId, []);
-                        }
-                        const queue = offlineMessageQueue.get(targetUserId);
-                        if (data.subType === 'unsend' && data.targetMessageId) {
-                            for (let i = queue.length - 1; i >= 0; i--) {
-                                if ((queue[i].messageId === data.targetMessageId || queue[i].targetMessageId === data.targetMessageId) && queue[i].fromUserId === data.fromUserId) {
-                                    queue.splice(i, 1);
-                                }
-                            }
-                        }
-                        else if (data.subType === 'edit' && data.targetMessageId) {
-                            for (let i = queue.length - 1; i >= 0; i--) {
-                                if (queue[i].subType === 'edit' && queue[i].targetMessageId === data.targetMessageId && queue[i].fromUserId === data.fromUserId) {
-                                    queue.splice(i, 1);
-                                }
-                            }
-                        }
-                        if (!queue.some(m => m.messageId && m.messageId === data.messageId)) {
-                            if (queue.length >= 100) {
-                                console.warn(`[E2EE Chat Queue Warning] キュー上限(100件)到達のため新規追加を遮断: target=${targetUserId}`);
-                            } else {
-                                queue.push(data);
-                                saveOfflineQueue();
-                                console.log(`[E2EE Chat Queue] 相手(${targetUserId})宛てキュー保管完了 (subType=${data.subType || 'normal'}, 保留計: ${queue.length}件)`);
-                            }
-                        }
-                    }
-
-                    if (type === 'chat_message' && !alreadyProcessed) {
-                        const targetFcm = fcmTokenStore.get(targetUserId) || fcmTokenStore.get((targetUserId || '').trim());
-                        if (targetFcm && targetFcm.fcmToken) {
-                            sendChatMessagePush(targetFcm.fcmToken, {
-                                subType: data.subType || '',
-                                targetMessageId: data.targetMessageId || '',
-                                fromUserId: (currentUserId || data.fromUserId),
-                                fromName: senderName,
-                                messageId: data.messageId,
-                                text: data.text || '',
-                                iv: data.iv || '',
-                                cipher: data.cipher || '',
-                                // VULN-50是正: 4KB上限超過によるプッシュ送信エラーを完全防止
-                                hasImage: data.imageBase64 ? 'true' : '',
-                                fileUrl: data.fileUrl || '',
-                                fileKey: '',
-                                fileName: data.fileName || '',
-                                fileSize: data.fileSize || '0',
-                                senderPubKey: data.senderPubKey || '',
-                                senderPubSig: data.senderPubSig || '',
-                                timestamp: data.timestamp || Date.now()
-                            });
-                        }
-
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({
-                                type: 'chat_sent_ack',
-                                messageId: data.messageId,
+                        const targetEntry = users.get(targetUserId);
+                        if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                            targetEntry.ws.send(JSON.stringify({
+                                type: 'chat_decrypt_error',
+                                fromUserId: regUid,
+                                targetUserId: targetUserId,
+                                messageId: messageId,
                                 timestamp: Date.now()
                             }));
                         }
-                    }
-                    return;
-                }
-
-                // 4.9. 暗号鍵不一致(復号失敗)エラー通知中継 (VULN-121是正: 認証済みUID強制上書き)
-                if (type === 'chat_decrypt_error') {
-                    const regUid = (currentUserId || '').trim();
-                    if (!regUid) {
-                        console.warn('[Security Block] 未登録ソケットからのchat_decrypt_errorを遮断');
-                        return;
-                    }
-                    const targetUserId = (data.targetUserId || data.targetId || '').trim();
-                    const messageId = (data.messageId || '').trim();
-                    if (!targetUserId || !messageId) { return; }
-
-                    const targetEntry = users.get(targetUserId);
-                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                        targetEntry.ws.send(JSON.stringify({
-                            type: 'chat_decrypt_error',
-                            fromUserId: regUid,
-                            targetUserId: targetUserId,
-                            messageId: messageId,
-                            timestamp: Date.now()
-                        }));
-                    }
-                    return;
-                }
-
-                // 5. 既読通知中継
-                if (type === 'chat_read') {
-                    const regUid = (currentUserId || '').trim();
-                    const senderUid = (data.fromUserId || '').trim();
-                    if (!regUid || (senderUid && senderUid !== regUid)) {
-                        console.warn(`[Security Block] 未認証または既読送信元UID不一致を遮断: registered=${regUid}, packet=${senderUid}`);
-                        return;
-                    }
-                    const fromUserId = regUid;
-                    const targetUserId = (data.targetUserId || data.targetId || '').trim();
-                    const messageIds = Array.isArray(data.messageIds) ? data.messageIds : (Array.isArray(data.ids) ? data.ids : []);
-                    if (!targetUserId || messageIds.length === 0) { return; }
-
-                    const targetEntry = users.get(targetUserId);
-                    let forwarded = false;
-                    if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
-                        targetEntry.ws.send(JSON.stringify({
-                            type: 'chat_read',
-                            fromUserId: fromUserId,
-                            targetUserId: targetUserId,
-                            messageIds: messageIds
-                        }));
-                        forwarded = true;
-                    }
-
-                    if (!offlineReadQueue.has(targetUserId)) {
-                        offlineReadQueue.set(targetUserId, []);
-                    }
-                    const rq = offlineReadQueue.get(targetUserId);
-                    if (rq.length >= 300) {
-                        console.warn(`[WS Chat Read Queue Warning] 既読キュー上限(300件)到達のため新規追加を遮断: target=${targetUserId}`);
-                    } else {
-                        rq.push({
-                            fromUserId: fromUserId,
-                            targetUserId: targetUserId,
-                            messageIds: messageIds,
-                            timestamp: Date.now()
-                        });
-                        saveOfflineReads();
-                    }
-                    console.log(`[WS Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー保持 (保留計: ${rq.length}件, WS即時=${forwarded})`);
-                    return;
-                }
-
-                // 6. 通話ルームJoin
-                if (type === 'join') {
-                    if (!data.token || !isValidSession(data.token, userId)) {
-                        console.warn(`[Security Block] 不正または無効なセッションのWebSocket参加要求を遮断: User=${userId}, Room=${roomId}`);
-                        ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized session' }));
-                        ws.close(4001, 'Unauthorized session');
                         return;
                     }
 
-                    // VULN-60 & VULN-86是正: 通話ルーム(uidA_uidB)の厳格な検証 (参加権限照合)
-                    const roomStr = typeof roomId === 'string' ? roomId.trim() : '';
-                    const allowedUids = roomStr ? (roomStr.match(/(?:u_[a-zA-Z0-9]+|bot_[a-zA-Z0-9]+)/g) || []) : [];
-                    const hasUser = allowedUids.includes(userId);
-                    if (!roomStr || allowedUids.length === 0 || !hasUser) {
-                        console.warn(`[Security Block] 権限のない通話ルームへの不正Join(未認可UID)を遮断: User=${userId}, Room=${roomId}`);
-                        ws.send(JSON.stringify({ type: 'error', message: 'Forbidden room access' }));
-                        ws.close(4003, 'Forbidden room access');
+                    // 5. 既読通知中継
+                    if (type === 'chat_read') {
+                        const regUid = (currentUserId || '').trim();
+                        const senderUid = (data.fromUserId || '').trim();
+                        if (!regUid || (senderUid && senderUid !== regUid)) {
+                            console.warn(`[Security Block] 未認証または既読送信元UID不一致を遮断: registered=${regUid}, packet=${senderUid}`);
+                            return;
+                        }
+                        const fromUserId = regUid;
+                        const targetUserId = (data.targetUserId || data.targetId || '').trim();
+                        const messageIds = Array.isArray(data.messageIds) ? data.messageIds : (Array.isArray(data.ids) ? data.ids : []);
+                        if (!targetUserId || messageIds.length === 0) { return; }
+
+                        const targetEntry = users.get(targetUserId);
+                        let forwarded = false;
+                        if (targetEntry && targetEntry.ws.readyState === WebSocket.OPEN) {
+                            targetEntry.ws.send(JSON.stringify({
+                                type: 'chat_read',
+                                fromUserId: fromUserId,
+                                targetUserId: targetUserId,
+                                messageIds: messageIds
+                            }));
+                            forwarded = true;
+                        }
+
+                        const readRes = enqueueOfflineRead(fromUserId, targetUserId, messageIds);
+                        if (!readRes.queued) {
+                            console.warn(`[WS Chat Read Queue Warning] 既読キュー上限(300件)到達のため新規追加を遮断: target=${targetUserId}`);
+                        }
+                        console.log(`[WS Chat Read Store] 相手(${targetUserId})宛ての既読通知をキュー保持 (保留計: ${readRes.size}件, WS即時=${forwarded})`);
                         return;
                     }
 
-                    // VULN-185是正: rooms Mapの上限保護(1000件)でメモリ枯渇DoSを完全遮断
-                    enforceMapSizeCap(rooms, 1000);
-                    if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
-                    const room = rooms.get(roomId);
+                    // 6. 通話ルームJoin
+                    if (type === 'join') {
+                        if (!data.token || !isValidSession(data.token, userId)) {
+                            console.warn(`[Security Block] 不正または無効なセッションのWebSocket参加要求を遮断: User=${userId}, Room=${roomId}`);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Unauthorized session' }));
+                            ws.close(4001, 'Unauthorized session');
+                            return;
+                        }
 
-                    // VULN-249是正: 旧ルームに所属している場合は先に退出
-                    if (currentRoomId && currentRoomId !== roomId && rooms.has(currentRoomId)) {
-                        const oldRoom = rooms.get(currentRoomId);
-                        oldRoom.forEach((client) => {
+                        // VULN-60 & VULN-86是正: 通話ルーム(uidA_uidB)の厳格な検証 (call_inviteと正規表現統一)
+                        const roomStr = typeof roomId === 'string' ? roomId.trim() : '';
+                        const allowedUids = roomStr ? (roomStr.match(/(?:u_[a-zA-Z0-9]+|bot_[a-zA-Z0-9_]+)/g) || []) : [];
+                        const hasUser = allowedUids.includes(userId);
+                        if (!roomStr || allowedUids.length === 0 || !hasUser) {
+                            console.warn(`[Security Block] 権限のない通話ルームへの不正Join(未認可UID)を遮断: User=${userId}, Room=${roomId}`);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Forbidden room access' }));
+                            ws.close(4003, 'Forbidden room access');
+                            return;
+                        }
+
+                        // VULN-185是正: rooms Mapの上限保護(1000件)でメモリ枯渇DoSを完全遮断
+                        enforceMapSizeCap(rooms, 1000);
+                        if (!rooms.has(roomId)) { rooms.set(roomId, new Set()); }
+                        const room = rooms.get(roomId);
+
+                        // VULN-249是正: 旧ルームに所属している場合は先に退出
+                        if (currentRoomId && currentRoomId !== roomId && rooms.has(currentRoomId)) {
+                            const oldRoom = rooms.get(currentRoomId);
+                            oldRoom.forEach((client) => {
+                                if (client.ws === ws || client.userId === userId) {
+                                    oldRoom.delete(client);
+                                }
+                            });
+                            if (oldRoom.size === 0) { rooms.delete(currentRoomId); }
+                        }
+
+                        room.forEach((client) => {
                             if (client.ws === ws || client.userId === userId) {
-                                oldRoom.delete(client);
+                                room.delete(client);
                             }
                         });
-                        if (oldRoom.size === 0) { rooms.delete(currentRoomId); }
-                    }
-
-                    room.forEach((client) => {
-                        if (client.ws === ws || client.userId === userId) {
-                            room.delete(client);
+                        if (room.size >= 2) {
+                            console.warn(`[Security Block] 通話ルーム定員(2名)超過の参加要求を遮断: User=${userId}, Room=${roomId}`);
+                            ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
+                            return;
                         }
-                    });
-                    if (room.size >= 2) {
-                        console.warn(`[Security Block] 通話ルーム定員(2名)超過の参加要求を遮断: User=${userId}, Room=${roomId}`);
-                        ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
-                        return;
-                    }
 
-                    currentRoomId = roomId;
-                    currentUserId = userId;
-                    ws.userId = userId;
-
-                    // VULN-29是正: joinパケット単体での無検証incoming_callおよびFCM自動発火を廃止
-                    // （着信通知はcall_inviteによる厳格なタイムスタンプ・Nonce・署名検証シーケンスのみで行う）
-
-                    const isCaller = !!data.isCaller;
-                    room.forEach((client) => {
-                        if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
-                            client.ws.send(JSON.stringify({ type: 'joined', peerId: userId, isCaller: isCaller }));
-                            ws.send(JSON.stringify({ type: 'joined', peerId: client.userId, isCaller: !!client.isCaller }));
+                        currentRoomId = roomId;
+                        currentUserId = userId;
+                        ws.userId = userId;
+                        if (!ws.sessionToken) {
+                            ws.sessionToken = data.token;
+                            ws.sessionJti = extractTokenJti(data.token);
                         }
-                    });
 
-                    room.add({ ws, userId, isCaller });
-                    console.log(`[Join] Room: ${roomId}, User: ${userId}, isCaller: ${isCaller}, Count: ${room.size}`);
-                    return;
-                }
+                        // VULN-29是正: joinパケット単体での無検証incoming_callおよびFCM自動発火を廃止
+                        // （着信通知はcall_inviteによる厳格なタイムスタンプ・Nonce・署名検証シーケンスのみで行う）
 
-                // 7. WebRTC SDP / ICE / Avatar 同期
-                if (['offer', 'answer', 'candidate', 'avatar_sync'].includes(type)) {
-                    if (!currentUserId || !currentRoomId) {
-                        console.warn(`[Security Block] 未Joinソケットからのシグナリングパケットを遮断: ${type}`);
-                        return;
-                    }
-                    if (message.length > 64 * 1024) {
-                        console.warn(`[Security Block] 許容サイズ(64KB)超過のシグナリングパケットを破棄: ${type}`);
-                        return;
-                    }
-
-                    const senderId = data.userId || data.fromUserId;
-                    if (senderId && senderId !== currentUserId) {
-                        console.warn(`[Security Block] シグナリングなりすましパケットを遮断: current=${currentUserId}, payloadSender=${senderId}`);
-                        return;
-                    }
-                    // No.10対策: サーバー側で認証済みUIDを強制バインド
-                    data.userId = currentUserId;
-
-                    if (rooms.has(currentRoomId)) {
-                        const room = rooms.get(currentRoomId);
+                        const isCaller = !!data.isCaller;
                         room.forEach((client) => {
                             if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
-                                client.ws.send(JSON.stringify(data));
+                                client.ws.send(JSON.stringify({ type: 'joined', peerId: userId, isCaller: isCaller }));
+                                ws.send(JSON.stringify({ type: 'joined', peerId: client.userId, isCaller: !!client.isCaller }));
                             }
                         });
-                    }
-                    return;
-                }
 
-                if (type === 'leave') {
-                    removeClientFromRoom(ws, currentRoomId, currentUserId);
-                    currentRoomId = null;
+                        room.add({ ws, userId, isCaller });
+                        console.log(`[Join] Room: ${roomId}, User: ${userId}, isCaller: ${isCaller}, Count: ${room.size}`);
+                        return;
+                    }
+
+                    // 7. WebRTC SDP / ICE / Avatar 同期
+                    if (['offer', 'answer', 'candidate', 'avatar_sync'].includes(type)) {
+                        if (!currentUserId || !currentRoomId) {
+                            console.warn(`[Security Block] 未Joinソケットからのシグナリングパケットを遮断: ${type}`);
+                            return;
+                        }
+                        if (message.length > 64 * 1024) {
+                            console.warn(`[Security Block] 許容サイズ(64KB)超過のシグナリングパケットを破棄: ${type}`);
+                            return;
+                        }
+
+                        const senderId = data.userId || data.fromUserId;
+                        if (senderId && senderId !== currentUserId) {
+                            console.warn(`[Security Block] シグナリングなりすましパケットを遮断: current=${currentUserId}, payloadSender=${senderId}`);
+                            return;
+                        }
+                        // No.10対策: サーバー側で認証済みUIDを強制バインド
+                        data.userId = currentUserId;
+
+                        if (rooms.has(currentRoomId)) {
+                            const room = rooms.get(currentRoomId);
+                            room.forEach((client) => {
+                                if (client.ws !== ws && client.ws.readyState === WebSocket.OPEN) {
+                                    client.ws.send(JSON.stringify(data));
+                                }
+                            });
+                        }
+                        return;
+                    }
+
+                    if (type === 'leave') {
+                        removeClientFromRoom(ws, currentRoomId, currentUserId);
+                        currentRoomId = null;
+                    }
                 }
-            }
-            catch (e) {
-                console.error('JSON parse or forward error:', e.message);
-            }
+                catch (e) {
+                    console.error('JSON parse or forward error:', e.message);
+                }
+            });
+
+            let isCleanedUp = false;
+            const onCloseOrError = () => {
+                if (isCleanedUp) { return; }
+                isCleanedUp = true;
+                clearTimeout(unauthTimeout);
+                const count = wsIpConnectionCount.get(wsClientIp) || 1;
+                if (count <= 1) { wsIpConnectionCount.delete(wsClientIp); }
+                else { wsIpConnectionCount.set(wsClientIp, count - 1); }
+
+                if (currentUserId && users.get(currentUserId)?.ws === ws) {
+                    users.delete(currentUserId);
+                    console.log(`[Unregister] Standby disconnected: ${currentUserId}`);
+                }
+                removeClientFromRoom(ws, currentRoomId, currentUserId);
+            };
+
+            ws.on('close', onCloseOrError);
+            ws.on('error', onCloseOrError);
         });
 
-        let isCleanedUp = false;
-        const onCloseOrError = () => {
-            if (isCleanedUp) { return; }
-            isCleanedUp = true;
-            clearTimeout(unauthTimeout);
-            const count = wsIpConnectionCount.get(wsClientIp) || 1;
-            if (count <= 1) { wsIpConnectionCount.delete(wsClientIp); }
-            else { wsIpConnectionCount.set(wsClientIp, count - 1); }
+        return wss;
+    }
 
-            if (currentUserId && users.get(currentUserId)?.ws === ws) {
-                users.delete(currentUserId);
-                console.log(`[Unregister] Standby disconnected: ${currentUserId}`);
-            }
-            removeClientFromRoom(ws, currentRoomId, currentUserId);
-        };
+    module.exports = {
+        setupWebSocketServer
+    };
 
-        ws.on('close', onCloseOrError);
-        ws.on('error', onCloseOrError);
-    });
-
-    return wss;
-}
-
-module.exports = {
-    setupWebSocketServer
-};
-
-return module.exports;
+    return module.exports;
 })({ exports: {} }, {});
-
-// ==================== [Main: server.js] ====================
-// 変更日時：2026年11月14日 19時20分
-// WebRTC Signaling Server エントリポイント (モジュール分割リファクタリング版)
-// 【AI厳守ルール】本ファイルまたは ./modules/*.js を変更した際は、必ず `node scripts/bundle_server_for_github.js` を実行し、
-// `server/server_single_for_github.js` に最新の変更内容を完全上書き反映すること（詳細は「サーバー更新指示書.txt」参照）。
-// 構成モジュール:
-//  - ./modules/stateStore.js          : セッション・オフラインキュー・FCMトークン・永続化ストア
-//  - ./modules/pushAndMail.js         : Firebase Admin FCMプッシュ送信・GAS/SMTPメール送信
-//  - ./modules/httpAuthRoutes.js      : 2段階認証OTP・セッション更新/再バインド・FCM登録API
-//  - ./modules/httpVaultRoutes.js     : 認証必須Vaultプロキシ・鍵ラップシークレット配布API
-//  - ./modules/httpChatAndFileRoutes.js: チャット保留取得・既読・メッセージ送信・暗号化ファイル転送API
-//  - ./modules/wsSignaling.js         : WebSocket P2P通話シグナリング ＆ E2EEチャット中継
 
 const http = require('http');
 const { ipConnectionTracker, enforceMapSizeCap, flushAllStoresSync } = __requireModule('./modules/stateStore');
@@ -4133,8 +3996,7 @@ const { setupWebSocketServer } = __requireModule('./modules/wsSignaling');
 const port = process.env.PORT || 3000;
 
 // HTTPサーバー (セキュリティヘッダー・レート制限・REST APIディスパッチ)
-const server = http.createServer(async (req, res) =>
-{
+const server = http.createServer(async (req, res) => {
     // セキュリティヘッダー付与
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
@@ -4145,17 +4007,14 @@ const server = http.createServer(async (req, res) =>
     // VULN-52是正: CORSワイルドカード(*)を撤廃し、特定信頼オリジンまたはネイティブアプリ直接通信のみ許可
     const origin = req.headers['origin'];
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (origin && allowedOrigins.includes(origin))
-    {
+    if (origin && allowedOrigins.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Device-Uid, X-Target-Uid');
     }
 
-    if (req.method === 'OPTIONS')
-    {
-        if (origin && allowedOrigins.includes(origin))
-        {
+    if (req.method === 'OPTIONS') {
+        if (origin && allowedOrigins.includes(origin)) {
             res.writeHead(204);
             res.end();
             return;
@@ -4168,8 +4027,7 @@ const server = http.createServer(async (req, res) =>
     const url = req.url || '';
 
     // VULN-182是正: ヘルスチェック(/health)をレートリミット判定の最優先前に処理し、Renderコンテナ強制再起動ループを完全阻止
-    if (req.method === 'GET' && (url === '/' || url === '/health'))
-    {
+    if (req.method === 'GET' && (url === '/' || url === '/health')) {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({
             status: 'ok',
@@ -4184,36 +4042,31 @@ const server = http.createServer(async (req, res) =>
     const clientIp = (forwardedIps.length > 0 ? forwardedIps[forwardedIps.length - 1] : null) || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
     let ipRecord = ipConnectionTracker.get(clientIp);
-    if (!ipRecord || now > ipRecord.resetTime)
-    {
+    if (!ipRecord || now > ipRecord.resetTime) {
         enforceMapSizeCap(ipConnectionTracker, 5000);
         ipRecord = { count: 0, resetTime: now + 60000 };
         ipConnectionTracker.set(clientIp, ipRecord);
     }
     ipRecord.count++;
     // VULN-186是正: モバイルCGNAT共有IPでの正規ユーザー巻き添え遮断を防ぐため上限を300req/分に適正化
-    if (ipRecord.count > 300)
-    {
+    if (ipRecord.count > 300) {
         res.writeHead(429, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'アクセス過多のため一時的に制限されています。少し待って再試行してください' }));
         return;
     }
 
     // 認証・FCMトークン系APIのディスパッチ
-    if (await handleAuthRoutes(req, res, url))
-    {
+    if (await handleAuthRoutes(req, res, url)) {
         return;
     }
 
     // 認証必須アカウントVaultプロキシAPIのディスパッチ
-    if (await handleVaultRoutes(req, res, url))
-    {
+    if (await handleVaultRoutes(req, res, url)) {
         return;
     }
 
     // チャット・暗号化ファイル転送系APIのディスパッチ
-    if (await handleChatAndFileRoutes(req, res, url))
-    {
+    if (await handleChatAndFileRoutes(req, res, url)) {
         return;
     }
 
@@ -4225,23 +4078,20 @@ const server = http.createServer(async (req, res) =>
 setupWebSocketServer(server);
 
 // グレースフルシャットダウン
-process.on('SIGTERM', () =>
-{
+process.on('SIGTERM', () => {
     console.log('[SIGTERM] シグナル受信: データを同期保存してシャットダウンします');
     flushAllStoresSync();
     process.exit(0);
 });
 
-process.on('SIGINT', () =>
-{
+process.on('SIGINT', () => {
     console.log('[SIGINT] シグナル受信: データを同期保存してシャットダウンします');
     flushAllStoresSync();
     process.exit(0);
 });
 
 // サーバー起動
-server.listen(port, () =>
-{
+server.listen(port, () => {
     console.log(`Signaling & Auth OTP Server listening on port ${port}`);
 });
 
