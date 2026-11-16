@@ -1,4 +1,4 @@
-// 変更日時：2026年11月16日 13時27分
+// 変更日時：2026年11月16日 15時56分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月16日 13時28分
+// 変更日時：2026年11月16日 15時55分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -133,6 +133,7 @@ const ATTACHMENT_ACLS_FILE = path.join(DATA_DIR, 'attachment_acls.json');
 const PHONE_STORE_FILE = path.join(DATA_DIR, 'phone_store.json');
 const VAULT_SECRETS_FILE = path.join(DATA_DIR, 'vault_secrets.json');
 const VAULT_STORE_FILE = path.join(DATA_DIR, 'vault_store.json');
+const CHAT_CHUNKS_FILE = path.join(DATA_DIR, 'chat_chunks_store.json');
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -234,6 +235,8 @@ function loadProfiles()
 }
 const vaultSecretsStore = new Map();
 const vaultDataStore = new Map();
+// Supabase未接続(ローカル開発)時のみ利用するチャットチャンク一時ストア (本番時はRenderメモリ温存のためSupabase直接保存)
+const chatChunkFallbackStore = new Map();
 // ユーザー電話番号管理ストア (Googleアカウント/email -> 電話番号・端末公開鍵・認証状態)
 const phoneStore = new Map();
 let remoteLoadPromise = null;
@@ -261,6 +264,10 @@ async function supabaseServiceUpsert(recordId, tagNickname, payloadStr)
             },
             body: JSON.stringify({ id: recordId, nickname: tagNickname, photoUrl: payloadStr })
         });
+        if (!resp.ok)
+        {
+            console.warn(`[Supabase Mirror] HTTP保存失敗 ${resp.status} (${recordId})`);
+        }
         return resp.ok;
     }
     catch (e)
@@ -441,6 +448,37 @@ function loadVaultDataStore()
     catch (e)
     {
         console.error('[Vault Data Error] 復元失敗:', e.message);
+    }
+}
+
+function saveChatChunkFallbackStore()
+{
+    if (chatChunkFallbackStore.size === 0) { return; }
+    try
+    {
+        writeEncryptedJsonFile(CHAT_CHUNKS_FILE, mapToPlainObject(chatChunkFallbackStore));
+    }
+    catch (e)
+    {
+        console.error('[Chat Chunks Fallback Error] 保存失敗:', e.message);
+    }
+}
+
+function loadChatChunkFallbackStore()
+{
+    if (isSupabaseServiceReady()) { return; }
+    try
+    {
+        const obj = readEncryptedJsonFile(CHAT_CHUNKS_FILE);
+        if (!obj) { return; }
+        for (const [k, v] of Object.entries(obj))
+        {
+            chatChunkFallbackStore.set(k, v);
+        }
+    }
+    catch (e)
+    {
+        console.error('[Chat Chunks Fallback Error] 復元失敗:', e.message);
     }
 }
 
@@ -1166,6 +1204,7 @@ function flushAllStoresSync()
         savePhoneStore();
         saveVaultSecrets();
         saveVaultDataStore();
+        saveChatChunkFallbackStore();
         console.log('[Graceful Shutdown] 全永続化ストアの暗号化同期保存が完了しました');
     }
     catch (e)
@@ -1185,6 +1224,7 @@ loadProfiles();
 loadPhoneStore();
 loadVaultSecrets();
 loadVaultDataStore();
+loadChatChunkFallbackStore();
 ensureRemoteStoresLoaded();
 
 setInterval(() =>
@@ -1276,6 +1316,8 @@ module.exports = {
     vaultSecretsStore,
     vaultDataStore,
     saveVaultDataStore,
+    chatChunkFallbackStore,
+    saveChatChunkFallbackStore,
     getOrCreateVaultSecretB64,
     ensureRemoteStoresLoaded,
     isSupabaseServiceReady,
@@ -2713,14 +2755,16 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpVaultRoutes.js] ====================
 __internalModules['./modules/httpVaultRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月14日 19時19分
-// [サーバーモジュール] 認証必須アカウントVaultプロキシ・鍵ラップシークレット配布・レガシーV3移行清掃HTTPルート
+// 変更日時：2026年11月16日 15時56分
+// [サーバーモジュール] 認証必須アカウントVaultプロキシ・チャット差分チャンク保管・鍵ラップシークレット配布HTTPルート
 
 const {
     ALLOWED_EMAIL_HASHES,
     activeSessions,
     vaultDataStore,
     saveVaultDataStore,
+    chatChunkFallbackStore,
+    saveChatChunkFallbackStore,
     getOrCreateVaultSecretB64,
     ensureRemoteStoresLoaded,
     isSupabaseServiceReady,
@@ -2737,6 +2781,11 @@ const {
 } = __requireModule('./modules/stateStore');
 
 const MAX_VAULT_PAYLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_CHUNK_PAYLOAD_BYTES = 5 * 1024 * 1024;
+const MAX_CHUNK_INDEX_BYTES = 1 * 1024 * 1024;
+const MAX_BATCH_CHUNK_COUNT = 24;
+const CHUNK_ID_REGEX = /^\d{4}-(?:0[1-9]|1[0-2])(?:_p[1-9]\d{0,2})?$/;
+const chunkWriteRateMap = new Map();
 
 // JSONレスポンス送信ヘルパー
 function sendJson(res, statusCode, payloadObj)
@@ -2824,7 +2873,222 @@ function isAllowedCipherFormat(vaultType, payload)
     {
         return payload.startsWith('ENC_HW_V1:') || payload.startsWith('ENC_BK_V4:');
     }
+    if (vaultType === 'chat')
+    {
+        return payload.startsWith('ENC_BK_V4Z:') || payload.startsWith('ENC_BK_V4:');
+    }
     return payload.startsWith('ENC_BK_V4:');
+}
+
+// チャット差分チャンク暗号文検証 (GZIP+V4 または V4 のみ許可)
+function isAllowedChunkCipher(payload, maxBytes)
+{
+    if (typeof payload !== 'string' || !payload || payload.length > maxBytes)
+    {
+        return false;
+    }
+    return payload.startsWith('ENC_BK_V4Z:') || payload.startsWith('ENC_BK_V4:');
+}
+
+// チャット差分チャンク用の決定論的レコードIDを解決
+function resolveChatChunkRecordIds(email, chunkId)
+{
+    const cleanEmail = email.trim().toLowerCase();
+    const accHash = sha256(`CELLPHONE_CHAT_CHUNK_V1:${cleanEmail}`).slice(0, 32);
+    const indexId = `cp_v4_cidx_${accHash}`;
+    if (!chunkId)
+    {
+        return { indexId, chunkRecordId: null };
+    }
+    const safeChunkKey = chunkId.replace(/-/g, '');
+    return { indexId, chunkRecordId: `cp_v4_chk_${accHash}_${safeChunkKey}` };
+}
+
+// Supabase直接読み書き (Supabase未設定のローカル環境のみメモリ・暗号化ファイルへフォールバック)
+async function readChunkRecord(recordId)
+{
+    if (isSupabaseServiceReady())
+    {
+        return await supabaseServiceSelect(recordId);
+    }
+    const localRec = chatChunkFallbackStore.get(recordId);
+    return localRec ? localRec.payload : null;
+}
+
+async function writeChunkRecord(recordId, tag, payload)
+{
+    if (isSupabaseServiceReady())
+    {
+        const ok = await supabaseServiceUpsert(recordId, tag, payload);
+        return { ok, remotePersisted: ok };
+    }
+    enforceMapSizeCap(chatChunkFallbackStore, 2000);
+    chatChunkFallbackStore.set(recordId, { tag, payload, updatedAt: Date.now() });
+    saveChatChunkFallbackStore();
+    return { ok: true, remotePersisted: false };
+}
+
+// チャンク書込レートリミット (60秒間に最大90書込まで許可)
+function isChunkWriteRateLimited(emailHash)
+{
+    const now = Date.now();
+    const rec = chunkWriteRateMap.get(emailHash);
+    if (!rec || now - rec.windowStart > 60000)
+    {
+        enforceMapSizeCap(chunkWriteRateMap, 1000);
+        chunkWriteRateMap.set(emailHash, { windowStart: now, count: 1 });
+        return false;
+    }
+    rec.count += 1;
+    return rec.count > 90;
+}
+
+// レガシー単一ファイルバックアップ(cp_v4_chat_*/cp_srv_chat_*)を移行完了後に安全清掃
+async function scrubDuplicateChatBlobs(email, deviceUid)
+{
+    const chatIds = resolveVaultRecordIds('chat', email, deviceUid);
+    if (chatIds && chatIds.v4Id)
+    {
+        vaultDataStore.delete(chatIds.v4Id);
+        saveVaultDataStore();
+        await supabaseServiceScrub(chatIds.v4Id, '');
+    }
+    const safeUid = (deviceUid || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (safeUid)
+    {
+        await supabaseServiceScrub(`cp_srv_chat_${safeUid}`, '');
+    }
+}
+
+// チャットチャンクIndex取得: GET /api/vault/chat-chunks/index
+async function handleChatChunkIndexGet(req, res, parsedUrl)
+{
+    try
+    {
+        const reqEmail = parsedUrl.searchParams.get('email') || '';
+        const reqDeviceUid = parsedUrl.searchParams.get('deviceUid') || '';
+        const auth = authenticateVaultRequest(req, res, reqEmail, reqDeviceUid);
+        if (!auth) { return; }
+
+        const ids = resolveChatChunkRecordIds(auth.email, null);
+        const indexPayload = await readChunkRecord(ids.indexId);
+        sendJson(res, 200, { success: true, recordId: ids.indexId, indexPayload: indexPayload || null });
+    }
+    catch (err)
+    {
+        console.error('[Chat Chunk Index GET Error]', err.message);
+        sendJson(res, 500, { success: false, error: 'チャンクインデックス取得に失敗しました' });
+    }
+}
+
+// チャットチャンク単体保存: POST /api/vault/chat-chunks
+async function handleChatChunkPost(req, res)
+{
+    try
+    {
+        const body = await parseJsonBody(req, MAX_CHUNK_PAYLOAD_BYTES + MAX_CHUNK_INDEX_BYTES + 16384);
+        const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
+        if (!auth) { return; }
+        if (isChunkWriteRateLimited(auth.emailHash))
+        {
+            sendJson(res, 429, { success: false, error: 'チャンク保存要求が一時的に集中しています' });
+            return;
+        }
+
+        const chunkId = typeof body.chunkId === 'string' ? body.chunkId.trim() : '';
+        const encryptedPayload = typeof body.encryptedPayload === 'string' ? body.encryptedPayload.trim() : '';
+        const indexPayload = typeof body.indexPayload === 'string' ? body.indexPayload.trim() : '';
+        if (!CHUNK_ID_REGEX.test(chunkId) || !isAllowedChunkCipher(encryptedPayload, MAX_CHUNK_PAYLOAD_BYTES))
+        {
+            sendJson(res, 400, { success: false, error: 'チャンクIDまたは暗号文形式が不正です' });
+            return;
+        }
+        if (indexPayload && !isAllowedChunkCipher(indexPayload, MAX_CHUNK_INDEX_BYTES))
+        {
+            sendJson(res, 400, { success: false, error: 'インデックス暗号文形式が不正です' });
+            return;
+        }
+
+        const ids = resolveChatChunkRecordIds(auth.email, chunkId);
+        const chunkWrite = await writeChunkRecord(ids.chunkRecordId, 'chat_chunk_v4', encryptedPayload);
+        if (!chunkWrite.ok)
+        {
+            sendJson(res, 502, { success: false, error: 'クラウドへのチャンク保存に失敗しました' });
+            return;
+        }
+        if (indexPayload && !(await writeChunkRecord(ids.indexId, 'chat_cidx_v4', indexPayload)).ok)
+        {
+            sendJson(res, 502, { success: false, error: 'チャンクインデックス保存に失敗しました' });
+            return;
+        }
+        if (body.scrubLegacyChat === true && isSupabaseServiceReady())
+        {
+            await scrubDuplicateChatBlobs(auth.email, auth.deviceUid);
+        }
+
+        console.log(`[Chat Chunk POST] ${chunkId} 保存完了: ${maskEmail(auth.email)} (chars=${encryptedPayload.length})`);
+        sendJson(res, 200, { success: true, chunkId, recordId: ids.chunkRecordId, remotePersisted: chunkWrite.remotePersisted });
+    }
+    catch (err)
+    {
+        console.error('[Chat Chunk POST Error]', err.message);
+        sendJson(res, 500, { success: false, error: 'チャンク保存処理に失敗しました' });
+    }
+}
+
+// チャットチャンク一括取得: POST /api/vault/chat-chunks/batch
+async function handleChatChunkBatchPost(req, res)
+{
+    try
+    {
+        const body = await parseJsonBody(req, 256 * 1024);
+        const auth = authenticateVaultRequest(req, res, body.email, body.deviceUid);
+        if (!auth) { return; }
+
+        const rawIds = Array.isArray(body.chunkIds) ? body.chunkIds.slice(0, MAX_BATCH_CHUNK_COUNT) : [];
+        const validIds = rawIds.map(v => (typeof v === 'string' ? v.trim() : '')).filter(v => CHUNK_ID_REGEX.test(v));
+        const uniqueIds = [...new Set(validIds)];
+        if (uniqueIds.length === 0)
+        {
+            sendJson(res, 200, { success: true, chunks: {} });
+            return;
+        }
+
+        const entries = await Promise.all(uniqueIds.map(async (cid) =>
+        {
+            const ids = resolveChatChunkRecordIds(auth.email, cid);
+            return [cid, await readChunkRecord(ids.chunkRecordId)];
+        }));
+        const chunksObj = {};
+        for (const [cid, payload] of entries) { if (payload) { chunksObj[cid] = payload; } }
+        sendJson(res, 200, { success: true, chunks: chunksObj });
+    }
+    catch (err)
+    {
+        console.error('[Chat Chunk Batch Error]', err.message);
+        sendJson(res, 500, { success: false, error: 'チャンク一括取得に失敗しました' });
+    }
+}
+
+// チャット差分チャンクHTTPルートディスパッチ
+async function handleChatChunkRoutes(req, res, pathname, parsedUrl)
+{
+    if (req.method === 'GET' && pathname === '/api/vault/chat-chunks/index')
+    {
+        await handleChatChunkIndexGet(req, res, parsedUrl);
+        return true;
+    }
+    if (req.method === 'POST' && pathname === '/api/vault/chat-chunks')
+    {
+        await handleChatChunkPost(req, res);
+        return true;
+    }
+    if (req.method === 'POST' && pathname === '/api/vault/chat-chunks/batch')
+    {
+        await handleChatChunkBatchPost(req, res);
+        return true;
+    }
+    return false;
 }
 
 // Vault・バックアッププロキシ系HTTPエンドポイントの処理
@@ -2841,6 +3105,11 @@ async function handleVaultRoutes(req, res, url)
     }
 
     const pathname = parsedUrl.pathname;
+
+    if (await handleChatChunkRoutes(req, res, pathname, parsedUrl))
+    {
+        return true;
+    }
 
     // [API Vault 1] 認証済みクライアント向けアカウント固有ラップシークレット取得
     if (req.method === 'POST' && pathname === '/api/vault/wrap-key')
