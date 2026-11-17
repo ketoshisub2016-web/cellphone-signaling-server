@@ -1,4 +1,4 @@
-// 変更日時：2026年11月17日 14時35分
+// 変更日時：2026年11月17日 19時02分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -9,7 +9,7 @@ function __requireModule(name) { return __internalModules[name]; }
 
 // ==================== [Module: ./modules/stateStore.js] ====================
 __internalModules['./modules/stateStore'] = (function(module, exports) {
-// 変更日時：2026年11月16日 17時24分
+// 変更日時：2026年11月17日 19時02分
 // [サーバーモジュール] セッション・オフラインキュー・FCMトークン・レート制限・暗号化永続化ストア
 
 const crypto = require('crypto');
@@ -95,7 +95,11 @@ function resolveKarexPairMapping(emailHash)
                 return {
                     uid: String(rec.uid).trim(),
                     partnerUid: String(rec.partnerUid || '').trim(),
-                    roomId: String(rec.roomId).trim()
+                    roomId: String(rec.roomId).trim(),
+                    myHomeLat: Number.isFinite(Number(rec.myHomeLat)) ? Number(rec.myHomeLat) : 0,
+                    myHomeLng: Number.isFinite(Number(rec.myHomeLng)) ? Number(rec.myHomeLng) : 0,
+                    partnerHomeLat: Number.isFinite(Number(rec.partnerHomeLat)) ? Number(rec.partnerHomeLat) : 0,
+                    partnerHomeLng: Number.isFinite(Number(rec.partnerHomeLng)) ? Number(rec.partnerHomeLng) : 0
                 };
             }
         }
@@ -2736,7 +2740,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpKarexAuthRoutes.js] ====================
 __internalModules['./modules/httpKarexAuthRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月16日 13時29分
+// 変更日時：2026年11月17日 19時02分
 // [サーバーモジュール] KareX (second-onl) Firebase Custom Token ＆ Supabase User JWT 認証ブリッジAPI (SEC-14)
 
 const crypto = require('crypto');
@@ -2906,6 +2910,10 @@ async function handleKarexAuthRoutes(req, res, url)
             uid: mapping.uid,
             partnerUid: mapping.partnerUid,
             roomId: mapping.roomId,
+            myHomeLat: mapping.myHomeLat || 0,
+            myHomeLng: mapping.myHomeLng || 0,
+            partnerHomeLat: mapping.partnerHomeLat || 0,
+            partnerHomeLng: mapping.partnerHomeLng || 0,
             firebaseCustomToken,
             supabaseJwt,
             supabaseExpiresIn: expiresInSec,
