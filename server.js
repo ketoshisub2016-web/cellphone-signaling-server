@@ -1,4 +1,4 @@
-// 変更日時：2026年11月16日 19時37分
+// 変更日時：2026年11月17日 14時35分
 // ============================================================================
 // GitHub (https://github.com/ketoshisub2016-web/cellphone-signaling-server/edit/main/server.js)
 // 単一ファイル貼り付け用バンドル (server/server_single_for_github.js)
@@ -3475,7 +3475,7 @@ return module.exports;
 
 // ==================== [Module: ./modules/httpChatAndFileRoutes.js] ====================
 __internalModules['./modules/httpChatAndFileRoutes'] = (function(module, exports) {
-// 変更日時：2026年11月16日 17時24分
+// 変更日時：2026年11月17日 14時38分
 // [サーバーモジュール] チャット保留取得・既読・メッセージ送信・暗号化ファイル転送HTTPルート
 
 const backupRateLimitMap = new Map(); // userId -> lastBackupTime
@@ -3530,6 +3530,7 @@ function toPublicProfilePayload(prof, unchanged = null)
         signature: prof.signature
     };
     if (prof.signatureV2) { base.signatureV2 = prof.signatureV2; }
+    if (prof.appVersion) { base.appVersion = prof.appVersion; }
     if (unchanged !== null) { base.unchanged = unchanged; }
     return base;
 }
@@ -4236,6 +4237,9 @@ async function handleChatAndFileRoutes(req, res, url) {
             const name = (body.name || '').trim();
             const avatarEnc = (body.avatarEnc || '').trim();
             const avatarHash = (body.avatarHash || '').trim();
+            const appVersion = typeof body.appVersion === 'string'
+                ? body.appVersion.trim().replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 32)
+                : '';
             const timestamp = Number(body.timestamp) || Date.now();
             const signature = (body.signature || '').trim();
             const signatureV2 = typeof body.signatureV2 === 'string' ? body.signatureV2.trim().slice(0, 512) : '';
@@ -4246,7 +4250,7 @@ async function handleChatAndFileRoutes(req, res, url) {
                 return true;
             }
 
-            if (!name && !avatarEnc && !avatarHash) {
+            if (!name && !avatarEnc && !avatarHash && !appVersion) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: '更新データがありません' }));
                 return true;
@@ -4266,6 +4270,7 @@ async function handleChatAndFileRoutes(req, res, url) {
                 name: name || existing.name || '',
                 avatarEnc: avatarEnc ? avatarEnc : (existing.avatarEnc || ''),
                 avatarHash: avatarHash || existing.avatarHash || '',
+                appVersion: appVersion || existing.appVersion || '',
                 timestamp: timestamp,
                 signature: signature || existing.signature || '',
                 signatureV2: signatureV2 || (name || avatarEnc ? '' : (existing.signatureV2 || ''))
